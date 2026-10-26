@@ -18,3 +18,13 @@ for mode in host host-audio device loader; do
         -fsanitize=address,undefined -Ichip $flags tests/usb_host_test.c -o "$USB_TEST_DIR/$mode"
     "$USB_TEST_DIR/$mode"
 done
+# USB audio (tests/uac_test.c): the default configuration (byte for byte the descriptors before FELUCCA_UAC_CH and
+# FELUCCA_UAC_24), the input alone, and the channel counts and sample sizes around it, with and without the console
+for flags in "" "-DTEST_OUT=0" "-DTEST_CH=4 -DTEST_24=1" "-DTEST_CH=4 -DTEST_24=1 -DTEST_CDC=1" "-DTEST_CH=1 -DTEST_OUT=0" \
+             "-DTEST_CH=2 -DTEST_24=1" "-DTEST_CH=8"; do
+    # Word splitting is intentional for the fixed compiler options above.
+    "${CC:-cc}" -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function \
+        -Wno-unused-variable -Wno-missing-field-initializers \
+        -fsanitize=address,undefined -Ichip $flags tests/uac_test.c -o "$USB_TEST_DIR/uac"
+    "$USB_TEST_DIR/uac"
+done
