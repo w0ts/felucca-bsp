@@ -19,12 +19,15 @@ for mode in host host-audio device loader; do
     "$USB_TEST_DIR/$mode"
 done
 # USB audio (tests/uac_test.c): the default configuration (byte for byte the descriptors before FELUCCA_UAC_CH and
-# FELUCCA_UAC_24), the input alone, and the channel counts and sample sizes around it, with and without the console
+# FELUCCA_UAC_24), the input alone, and the channel counts and sample sizes around it, with and without the console;
+# on the host's clock (FELUCCA_UAC_HOST_CLOCK, TEST_HC: minutes of a model host and crystal) by default, in 4 channels
+# 24-bit, and in 8 without the output
 for flags in "" "-DTEST_OUT=0" "-DTEST_CH=4 -DTEST_24=1" "-DTEST_CH=4 -DTEST_24=1 -DTEST_CDC=1" "-DTEST_CH=1 -DTEST_OUT=0" \
-             "-DTEST_CH=2 -DTEST_24=1" "-DTEST_CH=8"; do
+             "-DTEST_CH=2 -DTEST_24=1" "-DTEST_CH=8" "-DTEST_HC=1" "-DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1" \
+             "-DTEST_HC=1 -DTEST_CH=8 -DTEST_OUT=0"; do
     # Word splitting is intentional for the fixed compiler options above.
     "${CC:-cc}" -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function \
         -Wno-unused-variable -Wno-missing-field-initializers \
-        -fsanitize=address,undefined -Ichip $flags tests/uac_test.c -o "$USB_TEST_DIR/uac"
+        -fsanitize=address,undefined -Ichip $flags tests/uac_test.c -o "$USB_TEST_DIR/uac" -lm
     "$USB_TEST_DIR/uac"
 done
