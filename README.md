@@ -48,7 +48,7 @@ when they have been checked on a real unit.
 | --- | --- |
 | `chip/` | Registers, drivers and boot entry shared by the chip family; `libc.c` (the few routines a freestanding build needs); `ota.c` (the update session, which takes its hooks from the application); `fm1_perf.h` (cycle and stall counters) and `fm1_debug.h` (register access for development builds) |
 | `chip/usb_host.c`, `chip/usb_host_desc.h` | Opt-in USB MIDI host: direct or one powered hub, MIDI input/output; [API and limits](docs/USB_HOST.md) |
-| `chip/usb.c` | The USB device: MIDI, serial and audio classes (audio in, and with `FELUCCA_UAC_OUT` audio out) with the EP0 and poll code |
+| `chip/usb.c` | The USB device: MIDI, serial and audio classes (audio in, and with `FELUCCA_UAC_OUT` audio out) with the EP0 and poll code; the audio in has 2 channels or `FELUCCA_UAC_CH` (1..8, the caller's), 16-bit and with `FELUCCA_UAC_24` 24-bit too; `uac_play_take` gives the caller the computer's audio to mix itself (tests: `tests/uac_test.c`) |
 | `chip/fm1_sys.h`, `chip/fm1_guard.h` | Supply rails (VDC14 and SYSVDD at M-VAVE's levels), reboot and core reset; hardware guards (stack, write and fetch limits that end in the fault report), the stack floor, whether code runs in an interrupt |
 | `loader/` | The update loader (builds as a RAM image; it includes `chip/usb.c`, `chip/ota.c` and `chip/libc.c`) |
 | `boards/fm1/` | FM-1 wiring and drivers: LCD pins, key scan (with velocity and pressure from the keys, off by default: `fm1_input.h`), ADC channels, audio codec lines |
