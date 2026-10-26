@@ -950,6 +950,11 @@ static void sysex_byte(uint8_t b)
 #endif
         return;                                        /* another status aborts the unfinished frame */
     }
+#ifdef FELUCCA_SYSEX_BYTE
+    FELUCCA_SYSEX_BYTE(b);                             /* the firmware's: every byte of a SysEx from USB, F0 and F7
+                                                        * too (realtime left out), for its own frames longer than the
+                                                        * buffer below (a DX7 bank: 4104 bytes); USB interrupt */
+#endif
     if (b == 0xF0) {
         usb.sx_on = 1;
         usb.sx_len = 0;
@@ -998,6 +1003,11 @@ static void midi_in_event(uint32_t pkt)                 /* one USB-MIDI event pa
         uint32_t k, nb = cin == 4u || cin == 7u ? 3u : cin == 6u ? 2u : 1u;
         for (k = 0; k < nb; k++)
             sysex_byte((uint8_t)(pkt >> (8u * (k + 1u))));
+        return;
+    }
+    if (cin == 0xFu && st < 0xF8u && (usb.sx_on || st == 0xF0u)) {
+        sysex_byte((uint8_t)st);                       /* a SysEx byte alone (CIN 0xF, a single byte): macOS sends some
+                                                        * so inside a long frame (Melodee 55a0d62, for DX7 banks) */
         return;
     }
     if (st >= 0x80u && st < 0xF8u) {
