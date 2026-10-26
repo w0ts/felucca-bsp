@@ -33,6 +33,9 @@
  * firmware's own stems, say); 2 keeps the stereo master and today's descriptors. FELUCCA_UAC_24=1 adds 24-bit: alt
  * setting 2 of the input stream (alt 1 stays 16-bit), the host picks either. uac_capturing says whether the host takes
  * the input this render (the caller skips its stems otherwise). Neither changes anything when left at its default.
+ * FELUCCA_UAC_HOST_CLOCK=1 puts the input on the computer's clock: uac_tap resamples the I2S's frames to the USB
+ * frames' 44.1 kHz (a 16-tap fractional-delay filter, uac_hc_fir.h), its ratio steered by the ring's fill, and every
+ * packet is the plain 44.1 pattern; the endpoint is synchronous. Off (the default), nothing changes (below).
  * FELUCCA_USB_HOST=1 adds opt-in MIDI host mode; see docs/USB_HOST.md for the main-loop contract. */
 #include "fm1_usb.h"   /* registers (chip/) */
 /* Host is opt-in and excluded from update loaders, even with a global build flag. */
@@ -64,7 +67,12 @@
 #ifndef FELUCCA_UAC_24
 #define FELUCCA_UAC_24 0
 #endif
+#ifndef FELUCCA_UAC_HOST_CLOCK
+#define FELUCCA_UAC_HOST_CLOCK 0
+#endif
 #if !FELUCCA_UAC
+#undef FELUCCA_UAC_HOST_CLOCK
+#define FELUCCA_UAC_HOST_CLOCK 0
 #undef FELUCCA_UAC_48K
 #define FELUCCA_UAC_48K 0
 #undef FELUCCA_UAC_OUT
@@ -81,6 +89,9 @@
 #endif
 #if FELUCCA_UAC_48K && (FELUCCA_UAC_CH != 2 || FELUCCA_UAC_24)
 #error "FELUCCA_UAC_48K resamples stereo 16-bit only: set it to 0 with FELUCCA_UAC_CH != 2 or FELUCCA_UAC_24"
+#endif
+#if FELUCCA_UAC_HOST_CLOCK && FELUCCA_UAC_48K
+#error "FELUCCA_UAC_HOST_CLOCK resamples to 44.1 kHz only: set FELUCCA_UAC_48K to 0 with it"
 #endif
 enum { S_FADDR = 0, S_POWER = 1, S_INTRTX1 = 2, S_INTRTX2 = 3, S_INTRRX1 = 4, S_INTRRX2 = 5, S_INTRUSB = 6,
        S_INTRTX1E = 7, S_INTRTX2E = 8, S_INTRRX1E = 9, S_INTRRX2E = 10, S_INTRUSBE = 11, S_FRAME1 = 12,
@@ -230,6 +241,56 @@ static struct {
 #endif
 } rs;
 #endif
+#if FELUCCA_UAC_HOST_CLOCK
+/* The input on the computer's clock (FELUCCA_UAC_HOST_CLOCK). The ring holds frames at the host's 44.1 kHz, so
+ * every packet is the 44.1 pattern and nothing else: the endpoint is synchronous (UAC1 / USB 2.0 5.12.4.1: its
+ * rate follows SOF). uac_tap resamples each block from the I2S's clock: step, the I2S frames an output frame
+ * advances (Q30, ~1.0004), interpolates between frames with a 16-tap fractional-delay filter (uac_hc_fir.h: a
+ * Kaiser-windowed sinc at 64 positions, two rows blended), per channel 16 multiply-adds a frame, 24 bits in and
+ * out. A frame waits 8 input frames more (0.18 ms).
+ * The step is steered once a render (uac_render_start) from the ring's fill when a render starts, low-passed twice
+ * (HC_LPS), against UA_PRIME: a proportional part plus the trim, the error integrated (the learned ratio of the two
+ * clocks, kept over stream restarts: the same crystal). The fill is read in whole packets, as the polls see them
+ * taken, so it carries up to ~22 frames of error that slides with the polls against the host's SOFs (a 100 ppm
+ * crystal: once every 5 s). Near UA_PRIME the loop is slow (wn 0.05 rad/s), so that error moves the step by some
+ * tens of ppm at most, slowly (the latency wanders; a pitch error under a twentieth of a cent). Past HC_E1 frames,
+ * and through the first stream's first 20 s, it is fast (wn 0.9 rad/s): the ratio is learned in seconds. */
+#include "uac_hc_fir.h"
+#define HC_N UAC_HC_N
+#define HC_ONE (1u << 30)        /* a step of one frame, Q30 */
+/* the I2S frames in a USB frame, nominal: 44,117.647 / 44,100 (the trim learns the rest) */
+#define HC_STEP0 ((uint32_t)(((uint64_t)HC_ONE * 44117647u + 22050000u) / 44100000u))
+/* the gains (Q38 step a Q8 frame of error, Q46 a render of 256 frames a Q8 frame): wn 0.05 rad/s, critically damped,
+ * near UA_PRIME; wn 0.9 rad/s from HC_E1 frames away (blended up to HC_E0) and for the first stream's HC_ACQ */
+#define HC_KP_N 2435             /* 2 zeta wn / 44100 a frame */
+#define HC_KI_N 90               /* wn^2 / 44100 a frame a second, x a render's time */
+#define HC_KP_W 73044
+#define HC_KI_W 30000            /* (zeta 1.65: for the low-passes' lag) */
+#define HC_E1 32
+#define HC_E0 64
+#define HC_LPS 6                 /* each low-pass: 1 / 64 a render (~0.37 s with 256-frame halves) */
+#define HC_ACQ (20u * 44100u / HALF_FRAMES)   /* the first 20 s at the wide gains */
+#define HC_TRIM_MAX ((int64_t)2147484 << 16)   /* the trim: +-2000 ppm, Q46 */
+#define HC_ADJ_MAX 5368709       /* the step's whole correction: +-0.5 %, Q30 */
+_Static_assert((HC_N & (HC_N - 1u)) == 0 && HC_N == 16u, "the history wraps on a power of two; 16 taps (by 4)");
+static struct {
+    int32_t x[UA_CH][2u * HC_N]; /* each channel's last HC_N input frames, written twice (a window never wraps) */
+    uint32_t w;                  /* input frames written */
+    uint32_t pos;                /* the next output's place past frame w - 9, Q30 (0 .. HC_ONE) */
+    uint32_t step;               /* input frames an output frame advances, Q30 */
+    int32_t co[HC_N], dco[HC_N]; /* the filter at cpos, and its change an output frame (dpos) within row crow */
+    uint32_t cpos, crow;
+    int32_t dpos;
+    uint8_t cok;                 /* co is the filter at cpos */
+    int32_t lp1, lp2;            /* the fill at a render's start, low-passed twice, Q8 frames */
+    int64_t trim;                /* the learned step - HC_STEP0, Q46 */
+    uint32_t acq;                /* renders left at the wide gains: the first stream, the trim to learn */
+    uint8_t learned;             /* the trim has been learned once (it stays over streams) */
+#if FELUCCA_UAC_TONE
+    uint32_t tone;
+#endif
+} hc;
+#endif
 #endif
 
 static struct {
@@ -333,7 +394,8 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
  * audio output (FELUCCA_UAC_OUT), +0.08 the audio streaming interfaces first in the AC collection
  * (FELUCCA_UAC_AS_FIRST), +0.01 CDC
  * (+0.02 per FELUCCA_USB_LAYOUT step, so a host never reuses what it learnt about another layout);
- * +1.00 with 24-bit (FELUCCA_UAC_24), +10.00 x the channels when they are not 2 (FELUCCA_UAC_CH: 4 ch 16-bit 43.xx).
+ * +1.00 with 24-bit (FELUCCA_UAC_24), +10.00 x the channels when they are not 2 (FELUCCA_UAC_CH: 4 ch 16-bit 43.xx),
+ * +2.00 on the computer's clock (FELUCCA_UAC_HOST_CLOCK: a synchronous endpoint).
  * FELUCCA_USB_LAYOUT, how the CDC build presents itself (#67: macOS 13-15 attach Apple's CDC composite
  * driver to a misc / IAD device that has a CDC function, and their kernel audio driver then never
  * takes the audio interfaces; macOS 26 / 27 (usbaudiod, matched per interface) and iOS / iPadOS work):
@@ -387,6 +449,12 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #endif
 /* the input terminal's channels: 2 are L R (0x0003); any other count non-spatial (0: the host numbers them) */
 #define UA_CHCFG (FELUCCA_UAC_CH == 2 ? 0x0003u : 0u)
+/* EP4 IN: isochronous asynchronous (the I2S's clock), or with FELUCCA_UAC_HOST_CLOCK synchronous (the host's) */
+#if FELUCCA_UAC_HOST_CLOCK
+#define UA_EP_ATTR 0x0D
+#else
+#define UA_EP_ATTR 0x05
+#endif
 #define D_IT_LINE 12, 0x24, 2, 1, 0x03, 0x06, 0, UA_CH, UA_CHCFG & 0xFF, UA_CHCFG >> 8, 0, 0,
 #if FELUCCA_UAC
 #if FELUCCA_UAC_OUT
@@ -417,7 +485,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
     9, 4, (s), 1, 1, 1, 2, 0, 0,                           /* alt 1: the stream */                      \
     7, 0x24, 1, 2, 1, 0x01, 0x00,                          /* AS general: terminal 2, delay 1, PCM */   \
     D_FMT(2, 16)                                           /* type I: UA_CH ch, 16 bit, the rates */    \
-    9, 5, 0x84, 0x05, UAC_MAXP16 & 0xFF, UAC_MAXP16 >> 8, 1, 0, 0,   /* EP4 IN isochronous async, 1 ms */ \
+    9, 5, 0x84, UA_EP_ATTR, UAC_MAXP16 & 0xFF, UAC_MAXP16 >> 8, 1, 0, 0,   /* EP4 IN isochronous, 1 ms */ \
     7, 0x25, 1, 0x01, 0, 0, 0,                             /* CS endpoint: sampling frequency control */ \
     D_AS24(s)
 #if FELUCCA_UAC_24
@@ -425,7 +493,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
     9, 4, (s), 2, 1, 1, 2, 0, 0,                           /* alt 2: the stream in 24-bit */            \
     7, 0x24, 1, 2, 1, 0x01, 0x00,                          /* AS general: terminal 2, delay 1, PCM */   \
     D_FMT(3, 24)                                           /* type I: UA_CH ch, 3 bytes, 24 bit */      \
-    9, 5, 0x84, 0x05, UAC_MAXP24 & 0xFF, UAC_MAXP24 >> 8, 1, 0, 0,   /* EP4 IN isochronous async, 1 ms */ \
+    9, 5, 0x84, UA_EP_ATTR, UAC_MAXP24 & 0xFF, UAC_MAXP24 >> 8, 1, 0, 0,   /* EP4 IN isochronous, 1 ms */ \
     7, 0x25, 1, 0x01, 0, 0, 0,                             /* CS endpoint: sampling frequency control */
 #else
 #define D_AS24(s)
@@ -463,7 +531,11 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #define CDC_LEN 66                                         /* with its IAD */
 #define BCD_LO(cdc) (0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K) + 0x40 * FELUCCA_UAC_OUT + 0x08 * FELUCCA_UAC_AS_FIRST + \
                      ((cdc) ? 0x01 + 2 * FELUCCA_USB_LAYOUT : 0))
+#if FELUCCA_UAC_HOST_CLOCK
+#define BCD_HI (0x05 + FELUCCA_UAC_24 + 0x10 * (FELUCCA_UAC_CH == 2 ? 0 : FELUCCA_UAC_CH))   /* +2.00: host clock */
+#else
 #define BCD_HI (0x03 + FELUCCA_UAC_24 + 0x10 * (FELUCCA_UAC_CH == 2 ? 0 : FELUCCA_UAC_CH))
+#endif
 #define D_DEV(bcdusb, cls, sub, proto, cdc)                                                          \
     18, 1, (bcdusb) & 0xFF, (bcdusb) >> 8, (cls), (sub), (proto), 64, 0x09, 0x12, FELUCCA_USB_PID & 0xFF, \
     FELUCCA_USB_PID >> 8, BCD_LO(cdc), BCD_HI, 1, 2, 0, 1
@@ -1292,6 +1364,48 @@ static void ep3_tx(void)                                /* <= 63 bytes per packe
 
 #if FELUCCA_UAC
 /* ---- the audio input: audio.c produces (render start, then each block), TIMER5 consumes ---- */
+#if FELUCCA_UAC_HOST_CLOCK
+static void uac_hc_prime(uint32_t fill)                 /* the stream (re)starts: silence in, the learned ratio */
+{
+    uint32_t c, i;
+    for (c = 0; c < UA_CH; c++)
+        for (i = 0; i < 2u * HC_N; i++)
+            hc.x[c][i] = 0;
+    hc.w = 0;
+    hc.pos = 0;
+    hc.cok = 0;
+    hc.lp1 = hc.lp2 = (int32_t)(fill << 8);
+    if (!hc.learned) {
+        hc.learned = 1;
+        hc.acq = HC_ACQ;
+    }
+    hc.step = HC_STEP0 + (uint32_t)(int32_t)(hc.trim >> 16);
+}
+
+/* once a render, the fill when it starts: the step that brings it back to UA_PRIME (see hc) */
+static void uac_hc_steer(uint32_t fill)
+{
+    const int32_t e0 = (HC_E0 - HC_E1) << 8;
+    int32_t e, g, adj;
+    int64_t kp, ki;
+    hc.lp1 += ((int32_t)(fill << 8) - hc.lp1) >> HC_LPS;
+    hc.lp2 += (hc.lp1 - hc.lp2) >> HC_LPS;
+    e = hc.lp2 - (int32_t)(UA_PRIME << 8);
+    e = e > (int32_t)(UA_N << 6) ? (int32_t)(UA_N << 6) : e < -(int32_t)(UA_N << 6) ? -(int32_t)(UA_N << 6) : e;
+    g = (e < 0 ? -e : e) - (HC_E1 << 8);              /* the wide gains past HC_E1 frames, all of them at HC_E0 */
+    g = g > e0 || hc.acq ? e0 : g < 0 ? 0 : g;
+    if (hc.acq)
+        hc.acq--;
+    kp = HC_KP_N + (int64_t)(HC_KP_W - HC_KP_N) * g / e0;
+    ki = (HC_KI_N + (int64_t)(HC_KI_W - HC_KI_N) * g / e0) * HALF_FRAMES / 256;
+    hc.trim += e * ki;
+    hc.trim = hc.trim > HC_TRIM_MAX ? HC_TRIM_MAX : hc.trim < -HC_TRIM_MAX ? -HC_TRIM_MAX : hc.trim;
+    adj = (int32_t)(hc.trim >> 16) + (int32_t)((e * kp) >> 8);
+    adj = adj > HC_ADJ_MAX ? HC_ADJ_MAX : adj < -HC_ADJ_MAX ? -HC_ADJ_MAX : adj;
+    hc.step = HC_STEP0 + (uint32_t)adj;
+}
+#endif
+
 static __attribute__((noinline)) void uac_render_start(void)   /* audio ISR, before a half buffer renders */
 {
     uint32_t fill;
@@ -1317,6 +1431,9 @@ static __attribute__((noinline)) void uac_render_start(void)   /* audio ISR, bef
             for (c = 0; c < UA_CH; c++)
                 ua_ring[((r + i) & (UA_N - 1u)) * UA_CH + c] = 0;
         }
+#if FELUCCA_UAC_HOST_CLOCK
+        uac_hc_prime(prime);
+#endif
         RING_PUBLISH();
         ua_w = r + prime;
         uac.fill_min = prime;
@@ -1325,6 +1442,9 @@ static __attribute__((noinline)) void uac_render_start(void)   /* audio ISR, bef
         return;
     }
     fill = ua_w - ua_r;
+#if FELUCCA_UAC_HOST_CLOCK
+    uac_hc_steer(fill);
+#endif
     uac.fill_min = fill;
     if (fill < uac.fill_lo)
         uac.fill_lo = fill;
@@ -1412,6 +1532,92 @@ static __attribute__((noinline)) void uac_tap48(const int32_t *out, uint32_t n)
 }
 #endif
 
+#if FELUCCA_UAC_HOST_CLOCK
+/* the filter at place pos (Q30 past frame w - 9) into hc.co: rows pos / 2^24 and the next, blended by the rest
+ * (Q16; a row past UAC_HC_P / 2 is its mirror backwards). The place moves by step - HC_ONE an output frame, so within a
+ * row the blend moves by the same each time: hc.dco, added (16 additions a frame, shared by the channels); a new
+ * row, a new step or any other move (an input frame skipped or doubled) blends it again (16 multiplications). */
+static inline void uac_hc_filter(uint32_t pos, uint32_t step)
+{
+    uint32_t p = pos >> 24, j;
+    int32_t d = (int32_t)(pos - hc.cpos);
+    hc.cpos = pos;
+    if (hc.cok && p == hc.crow && d == hc.dpos) {
+        int32_t *c = hc.co;
+        const int32_t *dc = hc.dco;
+        for (j = 0; j < HC_N; j += 4u, c += 4, dc += 4) {
+            c[0] += dc[0];
+            c[1] += dc[1];
+            c[2] += dc[2];
+            c[3] += dc[3];
+        }
+        return;
+    }
+    {
+        int32_t fr = (int32_t)((pos >> 8) & 0xFFFFu), dfr = (int32_t)(step - HC_ONE) >> 8;
+        const int32_t *a = UAC_HC[p <= UAC_HC_P / 2u ? p : UAC_HC_P - p];
+        const int32_t *b = UAC_HC[p + 1u <= UAC_HC_P / 2u ? p + 1u : UAC_HC_P - p - 1u];
+        int ra = p > UAC_HC_P / 2u, rb = p + 1u > UAC_HC_P / 2u;
+        for (j = 0; j < HC_N; j++) {
+            int32_t x = a[ra ? HC_N - 1u - j : j], y = b[rb ? HC_N - 1u - j : j];
+            hc.co[j] = x + (int32_t)(((int64_t)(y - x) * fr) >> 16);
+            hc.dco[j] = (int32_t)(((int64_t)(y - x) * dfr) >> 16);
+        }
+        hc.crow = p;
+        hc.dpos = (int32_t)(step - HC_ONE);
+        hc.cok = 1;
+    }
+}
+
+/* the I2S's frames (n, UA_CH samples each) to the host's clock: each input frame enters the history, then the
+ * output frames (0, 1 or 2) whose place falls before the next: the filter at their place over the last HC_N */
+static __attribute__((noinline)) void uac_tap_hc(const int32_t *out, uint32_t n)
+{
+    uint32_t w = ua_w, i, k = 0, h = hc.w, pos = hc.pos, step = hc.step;
+    if (UA_N - (w - ua_r) < n + n / 128u + 2u) {       /* nobody reads: drop the block (<= n x 1.005 + 1) */
+        uac.overruns++;
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t s = h & (HC_N - 1u), c;
+        for (c = 0; c < UA_CH; c++) {
+            int32_t v = out ? out[UA_CH * i + c] : 0;
+            v = v > 8388607 ? 8388607 : v < -8388608 ? -8388608 : v;   /* 24 bits: the sums stay in 64 */
+            hc.x[c][s] = hc.x[c][s + HC_N] = v;
+        }
+        h++;
+        s = h & (HC_N - 1u);                            /* the window: frames h - HC_N .. h - 1 */
+        while (pos < HC_ONE) {
+            const int32_t *co = hc.co;
+            ua_smp_t *d = &ua_ring[((w + k++) & (UA_N - 1u)) * UA_CH];
+            uac_hc_filter(pos, step);
+            for (c = 0; c < UA_CH; c++) {
+                const int32_t *x = &hc.x[c][s], *q = co;
+                int64_t acc = 1 << (UAC_HC_Q - 1);
+                uint32_t j;
+                for (j = 0; j < HC_N; j += 4u, x += 4, q += 4)    /* (by four: the loads and sums in registers) */
+                    acc += (int64_t)q[0] * x[0] + (int64_t)q[1] * x[1] + (int64_t)q[2] * x[2] + (int64_t)q[3] * x[3];
+                d[c] = (ua_smp_t)UA_SMP((int32_t)(acc >> UAC_HC_Q));
+            }
+#if FELUCCA_UAC_TONE
+            {   /* bench: the triangles at the host's clock (not resampled), one per output frame */
+                uint32_t t = hc.tone, q = t < 50u ? t : 100u - t, q2 = t < 50u ? 50u - t : t - 50u;
+                hc.tone = t == 99u ? 0u : t + 1u;
+                d[0] = (int16_t)((int32_t)q * 1000 - 25000);
+                d[1] = (int16_t)((int32_t)q2 * 1000 - 25000);
+            }
+#endif
+            pos += step;
+        }
+        pos -= HC_ONE;
+    }
+    hc.w = h;
+    hc.pos = pos;
+    RING_PUBLISH();
+    ua_w = w + k;
+}
+#endif
+
 /* audio ISR: one block, n frames of UA_CH samples side by side (2: L R), 24-bit as the I2S takes it (the master
  * output, or the caller's own channels); out 0: n frames of silence */
 static __attribute__((noinline)) void uac_tap(const int32_t *out, uint32_t n)
@@ -1424,6 +1630,10 @@ static __attribute__((noinline)) void uac_tap(const int32_t *out, uint32_t n)
         uac_tap48(out, n);
         return;
     }
+#endif
+#if FELUCCA_UAC_HOST_CLOCK
+    uac_tap_hc(out, n);
+    return;
 #endif
     if (UA_N - (w - ua_r) < n) {                        /* nobody reads: drop the block */
         uac.overruns++;
@@ -1482,9 +1692,9 @@ static inline uint8_t *uac_put(uint8_t *p, const ua_smp_t *f, uint32_t wide)
 #endif
 }
 
-/* the next packet into d: 44 / 45 frames (+-1 to hold the ring's fill), from the ring or, until it is
- * primed, silence. An empty ring repeats the last frame. Returns the frame count (a frame: UA_CH samples, 2 bytes
- * each, 3 when wide). */
+/* the next packet into d: 44 / 45 frames (+-1 to hold the ring's fill; the pattern alone with FELUCCA_UAC_HOST_CLOCK),
+ * from the ring or, until it is primed, silence. An empty ring repeats the last frame. Returns the frame count (a
+ * frame: UA_CH samples, 2 bytes each, 3 when wide). */
 static uint32_t uac_packet(uint8_t *d, uint32_t wide)
 {
     uint32_t n = 44u, r, fill, k, i, lo = UA_LO, hi = UA_HI;
@@ -1507,6 +1717,9 @@ static uint32_t uac_packet(uint8_t *d, uint32_t wide)
             d[i] = 0;
         return n;
     }
+#if FELUCCA_UAC_HOST_CLOCK
+    (void)lo, (void)hi;                                 /* the pattern only: uac_tap's step holds the fill */
+#else
     if (uac.fill_min > hi) {
         n++;
         uac.adj_up++;
@@ -1514,6 +1727,7 @@ static uint32_t uac_packet(uint8_t *d, uint32_t wide)
         n--;
         uac.adj_down++;
     }
+#endif
     r = ua_r;
     fill = ua_w - r;
     RING_PUBLISH();                                     /* the slots after the index */
