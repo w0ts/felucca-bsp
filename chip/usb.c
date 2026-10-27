@@ -281,6 +281,7 @@ static struct {
 #if FELUCCA_UAC_OUT_FEEDBACK
     int32_t fill_q8;             /* the ring's fill as each packet arrives, low-passed (Q8 frames): the feedback */
     uint32_t fbs;                /* feedback packets queued */
+    uint32_t fb;                 /* the last one (10.14 frames a ms) */
     volatile uint32_t w0;        /* uo_w when the stream (re)started: the priming counts from it (no old frames) */
 #endif
 } uo;
@@ -346,7 +347,7 @@ static struct {
     uint32_t w;                  /* input frames written */
     uint32_t pos;                /* the next output's place past frame w - 9, Q30 (0 .. HC_ONE) */
     uint32_t step;               /* input frames an output frame advances, Q30 */
-    int32_t co[HC_N], dco[HC_N]; /* the filter at cpos, and its change an output frame (dpos) within row crow */
+    float co[HC_N], dco[HC_N];   /* the filter at cpos, and its change an output frame (dpos) within row crow */
     uint32_t cpos, crow;
     int32_t dpos;
     uint8_t cok;                 /* co is the filter at cpos */
@@ -1600,12 +1601,14 @@ static void uac_hc_prime(uint32_t fill)                 /* the stream (re)starts
     hc.step = HC_STEP0 + (uint32_t)(int32_t)(hc.trim >> 16);
 }
 
+/* a 32 x 32 -> 64-bit product out of line: on the FM-1 such a multiply inlined among loads now and then leaves a register
+ * a bit off (docs/CPU.md); here its product is used at once, before any load */
+static __attribute__((noinline)) int64_t uac_hc_mul(int32_t a, int32_t b) { return (int64_t)a * b; }
 /* once a render, the fill when it starts: the step that brings it back to UA_PRIME (see hc) */
 static void uac_hc_steer(uint32_t fill)
 {
     const int32_t e0 = (HC_E0 - HC_E1) << 8;
-    int32_t e, g, adj;
-    int64_t kp, ki;
+    int32_t e, g, adj, kp, ki;
     hc.lp1 += ((int32_t)(fill << 8) - hc.lp1) >> HC_LPS;
     hc.lp2 += (hc.lp1 - hc.lp2) >> HC_LPS;
     e = hc.lp2 - (int32_t)(UA_PRIME << 8);
@@ -1614,11 +1617,11 @@ static void uac_hc_steer(uint32_t fill)
     g = g > e0 || hc.acq ? e0 : g < 0 ? 0 : g;
     if (hc.acq)
         hc.acq--;
-    kp = HC_KP_N + (int64_t)(HC_KP_W - HC_KP_N) * g / e0;
-    ki = (HC_KI_N + (int64_t)(HC_KI_W - HC_KI_N) * g / e0) * HALF_FRAMES / 256;
-    hc.trim += e * ki;
+    kp = HC_KP_N + (HC_KP_W - HC_KP_N) * g / e0;      /* (g <= e0: in 32 bits) */
+    ki = (HC_KI_N + (HC_KI_W - HC_KI_N) * g / e0) * (int32_t)HALF_FRAMES / 256;
+    hc.trim += uac_hc_mul(e, ki);
     hc.trim = hc.trim > HC_TRIM_MAX ? HC_TRIM_MAX : hc.trim < -HC_TRIM_MAX ? -HC_TRIM_MAX : hc.trim;
-    adj = (int32_t)(hc.trim >> 16) + (int32_t)((e * kp) >> 8);
+    adj = (int32_t)(hc.trim >> 16) + (int32_t)(uac_hc_mul(e, kp) >> 8);
     adj = adj > HC_ADJ_MAX ? HC_ADJ_MAX : adj < -HC_ADJ_MAX ? -HC_ADJ_MAX : adj;
     hc.step = HC_STEP0 + (uint32_t)adj;
 }
@@ -1752,17 +1755,18 @@ static __attribute__((noinline)) void uac_tap48(const int32_t *out, uint32_t n)
 
 #if FELUCCA_UAC_HOST_CLOCK
 /* the filter at place pos (Q30 past frame w - 9) into hc.co: rows pos / 2^24 and the next, blended by the rest
- * (Q16; a row past UAC_HC_P / 2 is its mirror backwards). The place moves by step - HC_ONE an output frame, so within a
- * row the blend moves by the same each time: hc.dco, added (16 additions a frame, shared by the channels); a new
- * row, a new step or any other move (an input frame skipped or doubled) blends it again (16 multiplications). */
+ * (a row past UAC_HC_P / 2 is its mirror backwards), in single precision (the FPU: no 64-bit integer multiply in
+ * this loop, docs/CPU.md). The place moves by step - HC_ONE an output frame, so within a row the blend moves by the
+ * same each time: hc.dco, added (16 additions a frame, shared by the channels); a new row, a new step or any other
+ * move (an input frame skipped or doubled) blends it again (16 multiplications). */
 static inline void uac_hc_filter(uint32_t pos, uint32_t step)
 {
     uint32_t p = pos >> 24, j;
     int32_t d = (int32_t)(pos - hc.cpos);
     hc.cpos = pos;
     if (hc.cok && p == hc.crow && d == hc.dpos) {
-        int32_t *c = hc.co;
-        const int32_t *dc = hc.dco;
+        float *c = hc.co;
+        const float *dc = hc.dco;
         for (j = 0; j < HC_N; j += 4u, c += 4, dc += 4) {
             c[0] += dc[0];
             c[1] += dc[1];
@@ -1772,14 +1776,16 @@ static inline void uac_hc_filter(uint32_t pos, uint32_t step)
         return;
     }
     {
-        int32_t fr = (int32_t)((pos >> 8) & 0xFFFFu), dfr = (int32_t)(step - HC_ONE) >> 8;
+        const float q = 1.0f / (float)(1u << UAC_HC_Q);  /* (the table's Q30 to 1.0) */
+        float fr = (float)((pos >> 8) & 0xFFFFu) * (1.0f / 65536.0f);
+        float dfr = (float)((int32_t)(step - HC_ONE) >> 8) * (1.0f / 65536.0f);
         const int32_t *a = UAC_HC[p <= UAC_HC_P / 2u ? p : UAC_HC_P - p];
         const int32_t *b = UAC_HC[p + 1u <= UAC_HC_P / 2u ? p + 1u : UAC_HC_P - p - 1u];
         int ra = p > UAC_HC_P / 2u, rb = p + 1u > UAC_HC_P / 2u;
         for (j = 0; j < HC_N; j++) {
-            int32_t x = a[ra ? HC_N - 1u - j : j], y = b[rb ? HC_N - 1u - j : j];
-            hc.co[j] = x + (int32_t)(((int64_t)(y - x) * fr) >> 16);
-            hc.dco[j] = (int32_t)(((int64_t)(y - x) * dfr) >> 16);
+            float x = (float)a[ra ? HC_N - 1u - j : j] * q, y = (float)b[rb ? HC_N - 1u - j : j] * q;
+            hc.co[j] = x + (y - x) * fr;
+            hc.dco[j] = (y - x) * dfr;
         }
         hc.crow = p;
         hc.dpos = (int32_t)(step - HC_ONE);
@@ -1800,22 +1806,23 @@ static __attribute__((noinline)) void uac_tap_hc(const int32_t *out, uint32_t n)
         uint32_t s = h & (HC_N - 1u), c;
         for (c = 0; c < UA_CH; c++) {
             int32_t v = out ? out[UA_CH * i + c] : 0;
-            v = v > 8388607 ? 8388607 : v < -8388608 ? -8388608 : v;   /* 24 bits: the sums stay in 64 */
+            v = v > 8388607 ? 8388607 : v < -8388608 ? -8388608 : v;   /* 24 bits: exact in a float */
             hc.x[c][s] = hc.x[c][s + HC_N] = v;
         }
         h++;
         s = h & (HC_N - 1u);                            /* the window: frames h - HC_N .. h - 1 */
         while (pos < HC_ONE) {
-            const int32_t *co = hc.co;
+            const float *co = hc.co;
             ua_smp_t *d = &ua_ring[((w + k++) & (UA_N - 1u)) * UA_CH];
             uac_hc_filter(pos, step);
             for (c = 0; c < UA_CH; c++) {
-                const int32_t *x = &hc.x[c][s], *q = co;
-                int64_t acc = 1 << (UAC_HC_Q - 1);
+                const int32_t *x = &hc.x[c][s];
+                const float *q = co;
+                float acc = 0.0f;
                 uint32_t j;
                 for (j = 0; j < HC_N; j += 4u, x += 4, q += 4)    /* (by four: the loads and sums in registers) */
-                    acc += (int64_t)q[0] * x[0] + (int64_t)q[1] * x[1] + (int64_t)q[2] * x[2] + (int64_t)q[3] * x[3];
-                d[c] = (ua_smp_t)UA_SMP((int32_t)(acc >> UAC_HC_Q));
+                    acc += q[0] * (float)x[0] + q[1] * (float)x[1] + q[2] * (float)x[2] + q[3] * (float)x[3];
+                d[c] = (ua_smp_t)UA_SMP((int32_t)(acc + (acc < 0.0f ? -0.5f : 0.5f)));   /* (rounded) */
             }
 #if FELUCCA_UAC_TONE
             {   /* bench: the triangles at the host's clock (not resampled), one per output frame */
@@ -2112,6 +2119,7 @@ static void uo_fb_service(void)
     uo_fb[0] = (uint8_t)v;
     uo_fb[1] = (uint8_t)(v >> 8);
     uo_fb[2] = (uint8_t)(v >> 16);
+    uo.fb = v;
     fm1_usb_ep_send(3, uo_fb, 3);
     sie_wr(S_TXCSR1, 0x01);                             /* TxPktRdy */
     uo.fbs++;
