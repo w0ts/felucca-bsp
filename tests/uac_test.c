@@ -3,7 +3,7 @@
 /* USB audio input and output (chip/usb.c, FELUCCA_UAC): the driver against a model of the SIE and of a host that
  * takes one isochronous packet a millisecond, with the I2S at its own clock (44,117.6 Hz). Built once per
  * configuration (tests/run_usb_host_tests.sh): FELUCCA_UAC_CH (TEST_CH), FELUCCA_UAC_24 (TEST_24), FELUCCA_UAC_OUT
- * (TEST_OUT), FELUCCA_CDC (TEST_CDC), FELUCCA_UAC_HOST_CLOCK (TEST_HC).
+ * (TEST_OUT), FELUCCA_CDC (TEST_CDC), FELUCCA_UAC_HOST_CLOCK (TEST_HC), FELUCCA_UAC_OUT_FEEDBACK (TEST_FB).
  *   - the configuration descriptor walks as UAC1 (lengths, interfaces, the AC header's total, the input terminal, each
  *     streaming alt's format and packet size); in the default configuration, byte for byte the descriptors before
  *     FELUCCA_UAC_CH / FELUCCA_UAC_24 (TEST_GOLDEN)
@@ -14,6 +14,11 @@
  *   - on the host's clock (TEST_HC): the descriptors as the default's but EP4 IN synchronous and bcdDevice +2.00;
  *     minutes of a model crystal off by +-100, +-500 ppm and drifting: the strict 44.1 pattern, no ring under- or
  *     overrun, the servo's settling and wander, the output against a reference sine (THD+N, the largest error)
+ *   - the output against a sine the host plays (THD+N), the FM-1's crystal off: resampled (adaptive), or with the
+ *     feedback (TEST_FB): the descriptors as the default's but the output's endpoint asynchronous with its feedback
+ *     endpoint and bcdDevice +0.80; a host that sends what the feedback asks, minutes at 0, +-100, +-500 ppm and
+ *     drifting: every sample played once, in order, as sent (bit for bit), no under- or overrun, the fill near its
+ *     target and the feedback the I2S's true rate
  * It does not test the controller (the SIE's register sequences are the device's own) nor a real host's driver. */
 #include <assert.h>
 #include <math.h>
@@ -44,6 +49,9 @@
 #ifndef TEST_HC
 #define TEST_HC 0                                       /* FELUCCA_UAC_HOST_CLOCK */
 #endif
+#ifndef TEST_FB
+#define TEST_FB 0                                       /* FELUCCA_UAC_OUT_FEEDBACK */
+#endif
 #ifndef TEST_GOLDEN
 #define TEST_GOLDEN (TEST_CH == 2 && !TEST_24 && !TEST_CDC)   /* the configuration felucca-bsp had before them */
 #endif
@@ -53,6 +61,8 @@ static uint8_t regs[5][32], common[16], index_reg, last_read;
 static uint8_t *ep4rx_buf;
 static uint8_t in_pkt[1024];                            /* the packet queued on EP4 IN */
 static uint32_t in_len;
+static uint8_t fb_pkt[4];                               /* the packet queued on EP3 IN (the output's feedback) */
+static uint32_t fb_len;
 
 static void mock_write(uint32_t r, uint32_t v)
 {
@@ -62,8 +72,8 @@ static void mock_write(uint32_t r, uint32_t v)
         common[r] = (uint8_t)v;
     else if (index_reg == 0 && r == 17)
         regs[0][17] = 0;                                /* EP0: each request handled at once */
-    else if (index_reg == 4 && r == 17)
-        regs[4][17] = (uint8_t)(v & 1u);                /* TxPktRdy until the host takes the packet */
+    else if ((index_reg == 4 || (TEST_FB && index_reg == 3)) && r == 17)
+        regs[index_reg][17] = (uint8_t)(v & 1u);        /* TxPktRdy until the host takes the packet */
     else if (index_reg == 4 && r == 20)
         regs[4][20] = (uint8_t)(v & 0x10u ? 0u : v);    /* the OUT packet taken */
     else
@@ -74,7 +84,14 @@ static uint32_t mock_dt(void) { return last_read < 16 ? common[last_read] : regs
 static void mock_buf(uint32_t ep, void *p) { (void)ep, (void)p; }
 static void mock_ep4_txbuf(void *p) { (void)p; }
 static void mock_ep4_rxbuf(void *p) { ep4rx_buf = p; }
-static void mock_send(uint32_t ep, void *p, uint32_t n) { (void)ep, (void)p, (void)n; }
+static void mock_send(uint32_t ep, void *p, uint32_t n)
+{
+    if (ep == 3u && TEST_FB) {                          /* the feedback */
+        assert(n <= sizeof fb_pkt);
+        memcpy(fb_pkt, p, n);
+        fb_len = n;
+    }
+}
 static void mock_ep4_send(void *p, uint32_t n)
 {
     assert(n <= sizeof in_pkt);
@@ -119,6 +136,7 @@ static void fm1_delay_ms(uint32_t ms) { (void)ms; }
 #define FELUCCA_UAC_CH TEST_CH
 #define FELUCCA_UAC_24 TEST_24
 #define FELUCCA_UAC_HOST_CLOCK TEST_HC
+#define FELUCCA_UAC_OUT_FEEDBACK TEST_FB
 #define FELUCCA_CDC TEST_CDC
 #define FELUCCA_OTA 0
 #define FELUCCA_USB_HOST 0
@@ -186,6 +204,7 @@ static void test_descriptors(void)
     const uint8_t *d, *dv;
     uint16_t l, dl, i;
     uint32_t nif = 0, ac_total = 0, ac_sum = 0, alts = 0, it_ok = 0, cur_if = 0xFF, cur_alt = 0, sub = 0;
+    uint32_t out_eps = 0, fb_eps = 0;
     uint8_t seen_if[16] = {0};
     assert(get_desc(0x0100, &dv, &dl) && dl == 18);
     assert(get_desc(0x0200, &d, &l));
@@ -205,6 +224,10 @@ static void test_descriptors(void)
                 nif++;
             if (cur_if == UAC_AS_IF && cur_alt)
                 alts++;
+#if TEST_OUT
+            if (cur_if == UAC_ASO_IF && cur_alt)
+                assert(p[4] == 1u + TEST_FB);           /* the stream, and with TEST_FB its feedback */
+#endif
         } else if (p[1] == 0x24 && cur_if == AUD_IF) {  /* audio control */
             if (p[2] == 1) {
                 ac_total = p[5] | p[6] << 8;
@@ -226,18 +249,43 @@ static void test_descriptors(void)
             uint32_t mp = p[4] | p[5] << 8;
             assert(cur_if == UAC_AS_IF && p[3] == (TEST_HC ? 0x0D : 0x05));   /* asynchronous, or synchronous */
             assert(mp == 46u * TEST_CH * sub && mp <= 1023u);
+        } else if (p[1] == 5 && p[2] == 0x04) {         /* EP4 OUT: adaptive, or asynchronous with EP3 IN's feedback */
+            assert(TEST_OUT && p[3] == (TEST_FB ? 0x05 : 0x09) && p[8] == (TEST_FB ? 0x83 : 0));
+            out_eps++;
+        } else if (TEST_FB && p[1] == 5 && p[2] == 0x83) {   /* EP3 IN: the feedback, 3 bytes, every 2^4 ms */
+            assert(p[3] == 0x11 && (p[4] | p[5] << 8) == 3u && p[6] == 1 && p[7] == 4 && p[8] == 0);
+            fb_eps++;
         }
     }
     assert(i == l);
     assert(nif == d[4]);
     assert(it_ok && alts == 1u + TEST_24);
+    assert(out_eps == (uint32_t)TEST_OUT && fb_eps == (uint32_t)TEST_FB);
 #if TEST_GOLDEN
-    {   /* on the host's clock, the same but for EP4 IN's synchronization (0x05 -> 0x0D) and bcdDevice (+2.00) */
-        uint8_t g[sizeof GOLD_CFG], gd[18];
-        uint32_t k, eps = 0;
-        memcpy(g, GOLD_CFG, sizeof g);
+    {   /* on the host's clock, the same but for EP4 IN's synchronization (0x05 -> 0x0D) and bcdDevice (+2.00); with
+         * the feedback, the output's alt 1 two endpoints, EP4 OUT asynchronous (0x09 -> 0x05) with EP3 IN as its
+         * bSynchAddress, EP3 IN's 9 bytes after its CS endpoint, and bcdDevice +0.80 */
+        uint8_t g[sizeof GOLD_CFG + 9u], gd[18];
+        uint32_t k, eps = 0, gl = sizeof GOLD_CFG;
+        memcpy(g, GOLD_CFG, sizeof GOLD_CFG);
         memcpy(gd, GOLD_DEV, 18);
-        for (k = 0; TEST_HC && k < sizeof g; k += g[k])
+        for (k = 0; TEST_FB && k < gl; k += g[k]) {
+            if (g[k + 1] == 4 && g[k + 2] == UAC_ASO_IF && g[k + 3] == 1)
+                g[k + 4] = 2;
+            if (g[k + 1] == 5 && g[k + 2] == 0x04) {
+                static const uint8_t FB[9] = {9, 5, 0x83, 0x11, 3, 0, 1, 4, 0};
+                uint32_t at = k + g[k] + g[k + g[k]];  /* after its CS endpoint */
+                g[k + 3] = 0x05;
+                g[k + 8] = 0x83;
+                memmove(g + at + 9, g + at, gl - at);
+                memcpy(g + at, FB, 9);
+                gl += 9;
+                g[2] = (uint8_t)(gl & 0xFF);
+                g[3] = (uint8_t)(gl >> 8);
+                gd[12] = (uint8_t)(gd[12] + 0x80);
+            }
+        }
+        for (k = 0; TEST_HC && k < gl; k += g[k])
             if (g[k + 1] == 5 && g[k + 2] == 0x84) {
                 g[k + 3] = 0x0D;
                 eps++;
@@ -245,7 +293,7 @@ static void test_descriptors(void)
         if (TEST_HC)
             gd[13] = 0x05;
         assert(eps == (TEST_HC ? 1u : 0u));
-        assert(l == sizeof g && !memcmp(d, g, l));
+        assert(l == gl && !memcmp(d, g, l));
         assert(!memcmp(dv, gd, 18));
     }
 #endif
@@ -335,30 +383,10 @@ static void render_start_idle(void)
     assert(!uac_capturing());                           /* alt 0: nobody records, the stems may rest */
 }
 
-#if TEST_HC
-/* ------------------------------------------------- the host's clock --- */
-/* The FM-1's crystal off by ppm0 + drift x minutes (its error, its warming): the I2S and the polls with it; the
- * render a sine of hz in true time (channel c a phase c later), half of full scale; the host a SOF a millisecond
- * (test_hc). Checks that every packet is the 44.1 pattern (from the stream's first: 44 x 9, then 45), the ring
- * never runs dry or over, and the servo settles by 40 s: from then on its low-passed fill within HC_E1 frames of
- * UA_PRIME (the slow loop's band) and its step within HC_WANDER of the clocks' true ratio. After the settling, the
- * output against the sine at the host's clock: a least-squares fit over each 46 ms window (the sine, its
- * amplitude's and phase's slopes: a slow change of the latency does not count, as in a THD+N meter's tracking
- * notch), its residual the THD+N, and the largest residual sample. Returns the worst window's THD+N (dB). */
-typedef struct {
-    double ppm0, drift;          /* ppm, ppm a minute */
-    uint32_t minutes, hz, alt;
-    uint32_t keep;               /* 1: the trim the case before learned (a new stream, the same crystal) */
-} hc_case;
-
-#define HC_WANDER 40.0           /* ppm: the step's bound after the settling */
+#if TEST_HC || TEST_OUT
+/* a sine's least-squares fit over a window (the sine, its amplitude's and phase's slopes, DC): what is left of it */
 #define HC_WIN 2048u             /* the fit's window: 46 ms */
 #define HC_R 5                   /* its terms: the sine, its amplitude's and phase's slope over the window, DC */
-static struct {                 /* the measurement */
-    double y[8][HC_WIN], sum, worst, maxe;
-    uint32_t iw, nwin, started;
-} hc_m;
-
 static double hc_fit(const double *y, uint32_t n, double w, double *maxe)   /* residual / fundamental, power */
 {
     double m[HC_R][HC_R + 1] = {{0}}, a[HC_R], res = 0, fund = 0;
@@ -390,6 +418,30 @@ static double hc_fit(const double *y, uint32_t n, double w, double *maxe)   /* r
     }
     return res / fund;
 }
+
+#endif
+
+#if TEST_HC
+/* ------------------------------------------------- the host's clock --- */
+/* The FM-1's crystal off by ppm0 + drift x minutes (its error, its warming): the I2S and the polls with it; the
+ * render a sine of hz in true time (channel c a phase c later), half of full scale; the host a SOF a millisecond
+ * (test_hc). Checks that every packet is the 44.1 pattern (from the stream's first: 44 x 9, then 45), the ring
+ * never runs dry or over, and the servo settles by 40 s: from then on its low-passed fill within HC_E1 frames of
+ * UA_PRIME (the slow loop's band) and its step within HC_WANDER of the clocks' true ratio. After the settling, the
+ * output against the sine at the host's clock: a least-squares fit over each 46 ms window (the sine, its
+ * amplitude's and phase's slopes: a slow change of the latency does not count, as in a THD+N meter's tracking
+ * notch), its residual the THD+N, and the largest residual sample. Returns the worst window's THD+N (dB). */
+typedef struct {
+    double ppm0, drift;          /* ppm, ppm a minute */
+    uint32_t minutes, hz, alt;
+    uint32_t keep;               /* 1: the trim the case before learned (a new stream, the same crystal) */
+} hc_case;
+
+#define HC_WANDER 40.0           /* ppm: the step's bound after the settling */
+static struct {                 /* the measurement */
+    double y[8][HC_WIN], sum, worst, maxe;
+    uint32_t iw, nwin, started;
+} hc_m;
 
 static void hc_host_take(const hc_case *t, uint32_t *pacc, uint32_t settled_ms, uint32_t now_ms)
 {
@@ -530,10 +582,53 @@ static void host_out(uint32_t n, uint32_t *t)           /* an OUT packet of n st
     regs[4][20] = 1;                                    /* RxPktRdy */
 }
 
+/* the host's side of the output: one OUT packet a millisecond. Adaptive: the 44.1 pattern (44, 44 ... 45). With the
+ * feedback: the frames the last feedback it read asks for, the fraction carried (as a host's audio engine does), the
+ * feedback read every 2^4 ms (its bRefresh), the nominal 44.1 until the first */
+static struct {
+    uint32_t acc, fb, reads;
+    double fb_sum;
+    uint32_t fb_n;
+} hp;
+static void host_play_start(void)
+{
+    hp.acc = 0;
+    hp.fb = 44100u * 16384u / 1000u;
+    hp.reads = 0;
+    hp.fb_sum = 0;
+    hp.fb_n = 0;
+}
+static uint32_t host_play_n(uint32_t ms, int measure)
+{
+    uint32_t n;
+#if TEST_FB
+    if (!(ms & 15u) && (regs[3][17] & 1u)) {            /* the host's IN token on EP3: the feedback */
+        assert(fb_len == 3u);
+        hp.fb = fb_pkt[0] | (uint32_t)fb_pkt[1] << 8 | (uint32_t)fb_pkt[2] << 16;
+        assert(hp.fb >= UO_FB_NOM - UO_FB_MAX && hp.fb <= UO_FB_NOM + UO_FB_MAX);
+        regs[3][17] = 0;
+        hp.reads++;
+        if (measure) {
+            hp.fb_sum += hp.fb;
+            hp.fb_n++;
+        }
+    }
+    hp.acc += hp.fb;
+    n = hp.acc >> 14;
+    hp.acc &= 0x3FFFu;
+#else
+    (void)ms, (void)measure;
+    hp.acc += 441u;
+    n = hp.acc / 10u;
+    hp.acc %= 10u;
+#endif
+    return n;
+}
+
 static void test_play_take(void)
 {
     static int32_t a[2u * HALF_FRAMES], b[2u * HALF_FRAMES];
-    uint32_t ms, t = 0, acc = 0, cnt = 0, blocks = 0, with = 0, i, under = uo.underruns;
+    uint32_t ms, t = 0, acc = 0, blocks = 0, with = 0, i, under = uo.underruns;
     usb_start();
     setup(0x00, 9, 1, 0);
     for (i = 0; i < 2u * HALF_FRAMES; i++)
@@ -542,10 +637,9 @@ static void test_play_take(void)
     for (i = 0; i < 2u * HALF_FRAMES; i++)
         assert(b[i] == 0);
     setup(0x01, 11, 1, UAC_ASO_IF);
+    host_play_start();
     for (ms = 0; ms < 2000u; ms++) {
-        cnt += 441u;                                    /* the host's 44.1 kHz: 44, 44 ... 45 */
-        host_out(cnt / 10u, &t);
-        cnt %= 10u;
+        host_out(host_play_n(ms, 0), &t);
         usb_poll();
         usb_poll();
         for (acc += 441176u; acc >= HALF_FRAMES * 10000u; acc -= HALF_FRAMES * 10000u) {
@@ -573,6 +667,144 @@ static void test_play_take(void)
     setup(0x01, 11, 0, UAC_ASO_IF);
     assert(uac_play_take(b, HALF_FRAMES) == 0);
 }
+
+/* The output against the FM-1's crystal off by ppm0 + drift x minutes (real time in ms; the I2S and the polls with
+ * it, as test_hc): the host one OUT packet a millisecond (host_play_n). sine 0: a ramp (L t x 7, R 0x8000 - t x 3), and
+ * with the feedback every frame played must be the next one sent, bit for bit (adaptive: resampled, not checked so).
+ * sine hz: a sine at half of full scale in the host's samples, the output fitted over 46 ms windows after 10 s
+ * (hc_fit: its THD+N). Checks no under- or overrun once playing and, with the feedback, the fill within UO_FB_BAND of
+ * UO_TGT after 10 s and the feedback's mean the I2S's true rate within 20 ppm. Returns the worst window's THD+N. */
+typedef struct {
+    double ppm0, drift;
+    uint32_t minutes, hz;
+} play_case;
+#define UO_FB_BAND 48u                                  /* frames: the low-passed fill's distance from its target */
+
+static void host_out_sine(uint32_t n, uint32_t *t, uint32_t hz)   /* n frames of the host's sine, L and R alike */
+{
+    uint32_t i;
+    for (i = 0; i < n; i++, (*t)++) {
+        int16_t v = (int16_t)lrint(16384.0 * sin(2.0 * M_PI * hz * (double)*t / 44100.0));
+        memcpy(ep4rx_buf + 4u * i, &v, 2);
+        memcpy(ep4rx_buf + 4u * i + 2u, &v, 2);
+    }
+    regs[4][22] = (uint8_t)(4u * n);
+    regs[4][23] = (uint8_t)((4u * n) >> 8);
+    regs[4][20] = 1;
+}
+
+static double test_play_clock(play_case c)
+{
+    static int32_t b[2u * HALF_FRAMES];
+    static double y[HC_WIN];
+    const double nominal = 44117.647, total = c.minutes * 60000.0, settle = 10000.0;
+    double now = 0.0, sof = 0.0, poll = 0.137, ren = 0.311, k = 1.0, sum = 0, worst = 0, maxe = 0, w;
+    uint32_t t = 0, ms = 0, started = 0, next = 0, frames = 0, ok = 1, i, iw = 0, nwin = 0;
+    uint32_t lo = 0xFFFFFFFFu, hi = 0, under, over;
+    int32_t emax = 0;
+    memset(regs, 0, sizeof regs);
+    usb_start();
+    setup(0x00, 9, 1, 0);
+    setup(0x01, 11, 1, UAC_ASO_IF);
+    host_play_start();
+    under = uo.underruns, over = uo.overruns;
+    while (now < total) {
+        now = sof < poll ? (sof < ren ? sof : ren) : (poll < ren ? poll : ren);
+        k = 1.0 + (c.ppm0 + c.drift * now / 60000.0) * 1e-6;
+        if (now == sof) {                               /* the host's frame: an OUT packet */
+            uint32_t n = host_play_n(ms++, now >= settle);
+            if (c.hz)
+                host_out_sine(n, &t, c.hz);
+            else
+                host_out(n, &t);
+            sof += 1.0;
+        } else if (now == poll) {
+            usb_poll();
+            poll += 0.5 / k;
+        } else {                                        /* a render takes its block */
+            uint32_t f0 = uo_w - uo_r;                  /* (the fill a render starts at) */
+            int got = uac_play_take(b, HALF_FRAMES);
+            ren += HALF_FRAMES * 1000.0 / (nominal * k);
+            if (!got) {
+                assert(!started);                       /* (priming only: never once playing) */
+                continue;
+            }
+#if TEST_FB
+            if (now >= settle) {
+                int32_t e = uo.fill_q8 / 256 - (int32_t)UO_TGT;
+                lo = f0 < lo ? f0 : lo;
+                hi = f0 > hi ? f0 : hi;
+                emax = abs(e) > emax ? abs(e) : emax;
+            }
+#else
+            (void)f0;
+#endif
+            for (i = 0; i < HALF_FRAMES; i++) {
+                int32_t l = b[2u * i], r = b[2u * i + 1u];
+                if (!c.hz) {
+                    if (!started) {                     /* the first frame played: the host's frame next */
+                        uint32_t f;
+                        for (f = 0; f < t && (uint16_t)(f * 7u) != (uint16_t)(l >> 8); f++)
+                            ;
+                        next = f;
+                    }
+                    if (TEST_FB)
+                        ok &= l == (int32_t)(int16_t)(uint16_t)(next * 7u) * 256 &&
+                              r == (int32_t)(int16_t)(uint16_t)(0x8000u - next * 3u) * 256;
+                    next++;
+                } else if (now >= settle) {
+                    y[iw] = (double)l / 8388608.0;
+                    if (++iw == HC_WIN) {
+                        double q;
+                        w = 2.0 * M_PI * c.hz / (TEST_FB ? 44100.0 : nominal * k);   /* a frame's phase: the host's
+                                                                         * samples as they are, or at the I2S's rate */
+                        q = hc_fit(y, HC_WIN, w, &maxe);
+                        sum += q;
+                        worst = q > worst ? q : worst;
+                        nwin++;
+                        iw = 0;
+                    }
+                }
+                frames++;
+                started = 1;
+            }
+        }
+    }
+    printf("USB audio output (%s): I2S %+.0f ppm %+.0f ppm/min, %u min, %s %u Hz: %u frames played", TEST_FB ?
+           "the feedback" : "adaptive", c.ppm0, c.drift, c.minutes, c.hz ? "sine" : "ramp", c.hz, frames);
+    if (TEST_FB)
+        printf(", the fill at a render's start %u..%u, low-passed within %d of its target %u, feedback %.5f frames a ms "
+               "(the I2S %.5f) over %u reads", lo, hi, emax, (unsigned)UO_TGT, hp.fb_sum / hp.fb_n / 16384.0,
+               nominal * k / 1000.0, hp.fb_n);
+    if (c.hz)
+        printf(", THD+N %.1f dB (worst window %.1f)", 10.0 * log10(sum / nwin), 10.0 * log10(worst));
+    else if (TEST_FB)
+        printf(", every one as sent, in order");
+    assert(ok && uo.underruns == under && uo.overruns == over);
+#if TEST_FB
+    assert(lo >= HALF_FRAMES + HALF_FRAMES / 2u && emax <= (int32_t)UO_FB_BAND);   /* a render and half of one in
+                                                         * hand at its start; the fill near its target */
+    assert(fabs(hp.fb_sum / hp.fb_n / 16384.0 / (nominal * (1.0 + (c.ppm0 + c.drift * c.minutes / 2.0) * 1e-6) /
+                1000.0) - 1.0) < (c.drift ? 1e-4 : 2e-5));
+#endif
+    printf(": OK\n");
+    setup(0x01, 11, 0, UAC_ASO_IF);
+    return c.hz ? 10.0 * log10(worst) : 0.0;
+}
+
+static void test_play_clocks(void)
+{
+    static const play_case cases[] = {
+        {0, 0, 1, 0}, {100, 0, 1, 0}, {-100, 0, 1, 0}, {500, 0, 2, 0}, {-500, 0, 2, 0}, {-200, 40, 10, 0},
+        {500, 0, 1, 1000}, {-500, 0, 1, 1000}, {500, 0, 1, 10000}, {-500, 0, 1, 10000},
+    };
+    uint32_t k;
+    for (k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        double d = test_play_clock(cases[k]);
+        if (TEST_FB && cases[k].hz)
+            assert(d < -88.0);                          /* the samples as sent: 16-bit's own quantization */
+    }
+}
 #endif
 
 int main(void)
@@ -590,6 +822,7 @@ int main(void)
 #endif
 #if TEST_OUT
     test_play_take();
+    test_play_clocks();
 #endif
     printf("USB audio: all OK\n");
     return 0;
