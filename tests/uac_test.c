@@ -4,7 +4,7 @@
  * takes one isochronous packet a millisecond, with the I2S at its own clock (44,117.6 Hz). Built once per
  * configuration (tests/run_usb_host_tests.sh): FELUCCA_UAC_CH (TEST_CH), FELUCCA_UAC_24 (TEST_24), FELUCCA_UAC_OUT
  * (TEST_OUT), FELUCCA_CDC (TEST_CDC), FELUCCA_UAC_HOST_CLOCK (TEST_HC), FELUCCA_UAC_OUT_FEEDBACK (TEST_FB),
- * FELUCCA_UAC_OUT_24 (TEST_O24).
+ * FELUCCA_UAC_OUT_24 (TEST_O24), FELUCCA_UAC_SPLIT (TEST_SPLIT; TEST_NAMES: FELUCCA_UAC_CH_NAMES and the functions' names).
  *   - the configuration descriptor walks as UAC1 (lengths, interfaces, the AC header's total, the input terminal, each
  *     streaming alt's format and packet size); in the default configuration, byte for byte the descriptors before
  *     FELUCCA_UAC_CH / FELUCCA_UAC_24 (TEST_GOLDEN)
@@ -22,6 +22,9 @@
  *     target and the feedback the I2S's true rate
  *   - the output in 24-bit too (TEST_O24): its alt 2 in the descriptors (bcdDevice +8.00), the same streams in it,
  *     every 24-bit sample reaching the render whole
+ *   - the input and the output as two functions (TEST_SPLIT): three IADs, three audio control interfaces each with its
+ *     one streaming interface (MIDI's alone), byte for byte as written out here in the default's options; the names'
+ *     string descriptors; every stream test above on the moved interfaces
  * It does not test the controller (the SIE's register sequences are the device's own) nor a real host's driver. */
 #include <assert.h>
 #include <math.h>
@@ -58,8 +61,14 @@
 #ifndef TEST_O24
 #define TEST_O24 0                                      /* FELUCCA_UAC_OUT_24 */
 #endif
+#ifndef TEST_SPLIT
+#define TEST_SPLIT 0                                    /* FELUCCA_UAC_SPLIT */
+#endif
+#ifndef TEST_NAMES
+#define TEST_NAMES 0                                    /* with it: the names given */
+#endif
 #ifndef TEST_GOLDEN
-#define TEST_GOLDEN (TEST_CH == 2 && !TEST_24 && !TEST_CDC)   /* the configuration felucca-bsp had before them */
+#define TEST_GOLDEN (TEST_CH == 2 && !TEST_24 && !TEST_CDC && !TEST_SPLIT)   /* the configuration felucca-bsp had before them */
 #endif
 
 /* ------------------------------------------------------- the SIE model --- */
@@ -144,6 +153,16 @@ static void fm1_delay_ms(uint32_t ms) { (void)ms; }
 #define FELUCCA_UAC_HOST_CLOCK TEST_HC
 #define FELUCCA_UAC_OUT_FEEDBACK TEST_FB
 #define FELUCCA_UAC_OUT_24 TEST_O24
+#define FELUCCA_UAC_SPLIT TEST_SPLIT
+#if TEST_NAMES
+#define FELUCCA_UAC_IN_NAME "Optimist In"
+#define FELUCCA_UAC_OUT_NAME "Optimist Out"
+#if TEST_CH == 2
+#define FELUCCA_UAC_CH_NAMES "MASTER L", "MASTER R"
+#elif TEST_CH == 4
+#define FELUCCA_UAC_CH_NAMES "CH1", "CH2", "CH3", "CH4"
+#endif
+#endif
 #define FELUCCA_CDC TEST_CDC
 #define FELUCCA_OTA 0
 #define FELUCCA_USB_HOST 0
@@ -211,7 +230,7 @@ static void test_descriptors(void)
     const uint8_t *d, *dv;
     uint16_t l, dl, i;
     uint32_t nif = 0, ac_total = 0, ac_sum = 0, alts = 0, it_ok = 0, cur_if = 0xFF, cur_alt = 0, sub = 0;
-    uint32_t out_eps = 0, fb_eps = 0, out_alts = 0, osub = 0;
+    uint32_t out_eps = 0, fb_eps = 0, out_alts = 0, osub = 0, cur_ac = 0, acs = 0, iads = 0;
     uint8_t seen_if[16] = {0};
     assert(get_desc(0x0100, &dv, &dl) && dl == 18);
     assert(get_desc(0x0200, &d, &l));
@@ -224,10 +243,16 @@ static void test_descriptors(void)
         const uint8_t *p = d + i;
         assert(p[0] >= 2 && i + p[0] <= l);
         if (p[1] == 4) {                                /* interface */
-            if (cur_if == AUD_IF && ac_total)
+            if (cur_ac && ac_total)
                 assert(ac_sum == ac_total);             /* the AC header's total: its class-specific descriptors */
             cur_if = p[2];
             cur_alt = p[3];
+            cur_ac = p[5] == 1 && p[6] == 1;            /* audio control */
+            ac_total = 0;
+            if (cur_ac) {
+                acs++;
+                assert(p[8] == (!TEST_SPLIT || cur_if == AUD_IF ? 0 : cur_if == UAC_AS_IF - 1u ? 3 : 4));   /* named */
+            }
             if (!seen_if[cur_if & 15u]++)
                 nif++;
             if (cur_if == UAC_AS_IF && cur_alt)
@@ -238,10 +263,16 @@ static void test_descriptors(void)
                 out_alts++;
             }
 #endif
-        } else if (p[1] == 0x24 && cur_if == AUD_IF) {  /* audio control */
+        } else if (TEST_SPLIT && p[1] == 0x0B) {        /* IAD: MIDI's, the input's, the output's */
+            assert(TEST_SPLIT && p[0] == 8 && p[2] == 2u * iads && p[3] == 2 && p[4] == 1 && p[5] == 1);
+            assert(p[7] == (iads == 0 ? 0 : iads == 1 ? 3 : 4));
+            iads++;
+        } else if (p[1] == 0x24 && cur_ac) {            /* audio control */
             if (p[2] == 1) {
                 ac_total = p[5] | p[6] << 8;
                 ac_sum = 0;
+                if (TEST_SPLIT)                         /* its collection: its one streaming interface */
+                    assert(p[7] == 1 && p[8] == cur_if + 1u);
             }
             ac_sum += p[0];
             if (p[2] == 2 && p[3] == 1) {               /* input terminal 1, the line: the input's channels */
@@ -249,6 +280,7 @@ static void test_descriptors(void)
                 for (m = cfg; m; m >>= 1)
                     bits += m & 1u;
                 assert(p[7] == TEST_CH && (cfg == 0 || bits == TEST_CH));
+                assert(p[10] == (TEST_SPLIT && TEST_NAMES ? 5 : 0));   /* iChannelNames */
                 it_ok = 1;
             }
         } else if (TEST_OUT && p[1] == 0x24 && cur_if == UAC_ASO_IF && p[2] == 2) {   /* the output's format */
@@ -271,8 +303,34 @@ static void test_descriptors(void)
             fb_eps++;
         }
     }
+    if (cur_ac && ac_total)
+        assert(ac_sum == ac_total);
     assert(i == l);
     assert(nif == d[4]);
+    assert(acs == (TEST_SPLIT ? 2u + TEST_OUT : 1u) && iads == (TEST_SPLIT ? 2u + TEST_OUT : 0u));
+#if TEST_SPLIT
+    {   /* misc / IAD; the names */
+        static const char *const want[] = {"Optimist In", "Optimist Out", "MASTER L", "MASTER R", "CH1", "CH2", "CH3", "CH4"};
+        const uint8_t *sd;
+        uint16_t sl;
+        uint32_t k;
+        assert(dv[2] == 0x00 && dv[3] == 0x02 && dv[4] == 0xEF && dv[5] == 0x02 && dv[6] == 0x01);
+        assert((dv[12] & 0x08u) == 0x08u);
+        for (k = 3; k < 16u; k++) {
+            int has = get_desc(0x0300 | k, &sd, &sl);
+            const char *w = !TEST_NAMES ? (k == 3 ? "Felucca In" : k == 4 && TEST_OUT ? "Felucca Out" : 0)
+                          : k == 3 ? want[0] : k == 4 ? (TEST_OUT ? want[1] : 0)
+                          : k - 5u < TEST_CH ? want[(TEST_CH == 2 ? 2u : 4u) + k - 5u] : 0;
+            uint32_t j;
+            assert(has == (w != 0));
+            if (!w)
+                continue;
+            assert(sd[1] == 3 && sl == sd[0] && sl == 2u + 2u * strlen(w));
+            for (j = 0; w[j]; j++)
+                assert(sd[2 + 2 * j] == (uint8_t)w[j] && sd[3 + 2 * j] == 0);
+        }
+    }
+#endif
     assert(it_ok && alts == 1u + TEST_24);
     assert(out_eps == TEST_OUT * (1u + TEST_O24) && fb_eps == TEST_FB * (1u + TEST_O24));
     assert(out_alts == TEST_OUT * (1u + TEST_O24));
@@ -318,10 +376,37 @@ static void test_descriptors(void)
                 eps++;
             }
         if (TEST_HC)
-            gd[13] = 0x05;
+            gd[13] = (uint8_t)(gd[13] + 2);
         assert(eps == (TEST_HC ? 1u : 0u));
         assert(l == gl && !memcmp(d, g, l));
         assert(!memcmp(dv, gd, 18));
+    }
+#endif
+#if TEST_SPLIT && TEST_CH == 2 && !TEST_24 && TEST_OUT && !TEST_FB && !TEST_O24 && !TEST_HC
+    {   /* the two functions, written out: the default's options (2 channels, 16-bit, the output adaptive) */
+        static const uint8_t G[] = {
+            9, 2, 51, 1, 6, 1, 0, 0x80, 50,                             /* configuration: 307 bytes, 6 interfaces */
+            8, 0x0B, 0, 2, 1, 1, 0, 0,                                  /* IAD: MIDI, IF 0-1 */
+            9, 4, 0, 0, 0, 1, 1, 0, 0, 9, 0x24, 1, 0, 1, 9, 0, 1, 1,     /* AC 0: its collection MIDI's IF 1 alone */
+            9, 4, 1, 0, 2, 1, 3, 0, 0, 7, 0x24, 1, 0, 1, 0x41, 0,       /* MIDI streaming (as before) */
+            6, 0x24, 2, 1, 1, 0, 6, 0x24, 2, 2, 2, 0, 9, 0x24, 3, 1, 3, 1, 2, 1, 0, 9, 0x24, 3, 2, 4, 1, 1, 1, 0,
+            9, 5, 0x01, 2, 64, 0, 0, 0, 0, 5, 0x25, 1, 1, 1, 9, 5, 0x81, 2, 64, 0, 0, 0, 0, 5, 0x25, 1, 1, 3,
+            8, 0x0B, 2, 2, 1, 1, 0, 3,                                  /* IAD: the input, IF 2-3, string 3 */
+            9, 4, 2, 0, 0, 1, 1, 0, 3, 9, 0x24, 1, 0, 1, 30, 0, 1, 3,    /* AC 2, named; its collection IF 3 */
+            12, 0x24, 2, 1, 0x03, 0x06, 0, 2, 3, 0, TEST_NAMES ? 5 : 0, 0,   /* IT 1: line, L R (names from 5) */
+            9, 0x24, 3, 2, 1, 1, 0, 1, 0,                               /* OT 2: USB streaming */
+            9, 4, 3, 0, 0, 1, 2, 0, 0, 9, 4, 3, 1, 1, 1, 2, 0, 0, 7, 0x24, 1, 2, 1, 1, 0,
+            11, 0x24, 2, 1, 2, 2, 16, 1, 0x44, 0xAC, 0, 9, 5, 0x84, 5, 184, 0, 1, 0, 0, 7, 0x25, 1, 1, 0, 0, 0,
+            8, 0x0B, 4, 2, 1, 1, 0, 4,                                  /* IAD: the output, IF 4-5, string 4 */
+            9, 4, 4, 0, 0, 1, 1, 0, 4, 9, 0x24, 1, 0, 1, 30, 0, 1, 5,    /* AC 4, named; its collection IF 5 */
+            12, 0x24, 2, 3, 1, 1, 0, 2, 3, 0, 0, 0, 9, 0x24, 3, 4, 1, 3, 0, 3, 0,   /* IT 3 USB streaming, OT 4 speaker */
+            9, 4, 5, 0, 0, 1, 2, 0, 0, 9, 4, 5, 1, 1, 1, 2, 0, 0, 7, 0x24, 1, 3, 1, 1, 0,
+            11, 0x24, 2, 1, 2, 2, 16, 1, 0x44, 0xAC, 0, 9, 5, 0x04, 9, 196, 0, 1, 0, 0, 7, 0x25, 1, 0, 0, 0, 0,
+        };
+        static const uint8_t GD[18] = {18, 1, 0x00, 0x02, 0xEF, 0x02, 0x01, 64, 0x09, 0x12, 0x01, 0x00,
+                                       0x10 + 0x40 + 0x08, 0x03, 1, 2, 0, 1};
+        assert(l == sizeof G && !memcmp(d, G, l));
+        assert(!memcmp(dv, GD, 18));
     }
 #endif
 #ifdef TEST_DUMP
