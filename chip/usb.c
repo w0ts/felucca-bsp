@@ -278,6 +278,7 @@ static struct {
 #if FELUCCA_UAC_OUT_FEEDBACK
     int32_t fill_q8;             /* the ring's fill as each packet arrives, low-passed (Q8 frames): the feedback */
     uint32_t fbs;                /* feedback packets queued */
+    uint32_t fb;                 /* the last one (10.14 frames a ms) */
     volatile uint32_t w0;        /* uo_w when the stream (re)started: the priming counts from it (no old frames) */
 #endif
 } uo;
@@ -2105,6 +2106,7 @@ static void uo_fb_service(void)
     uo_fb[0] = (uint8_t)v;
     uo_fb[1] = (uint8_t)(v >> 8);
     uo_fb[2] = (uint8_t)(v >> 16);
+    uo.fb = v;
     fm1_usb_ep_send(3, uo_fb, 3);
     sie_wr(S_TXCSR1, 0x01);                             /* TxPktRdy */
     uo.fbs++;
