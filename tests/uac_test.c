@@ -744,6 +744,7 @@ static uint32_t host_play_n(uint32_t ms, int measure)
         assert(fb_len == 3u);
         hp.fb = fb_pkt[0] | (uint32_t)fb_pkt[1] << 8 | (uint32_t)fb_pkt[2] << 16;
         assert(hp.fb >= UO_FB_NOM - UO_FB_MAX && hp.fb <= UO_FB_NOM + UO_FB_MAX);
+        assert(uo.fb == hp.fb);                         /* uo.fb: the one queued, for a counters page */
         regs[3][17] = 0;
         hp.reads++;
         if (measure) {
