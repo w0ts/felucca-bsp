@@ -48,8 +48,14 @@ static inline void *fl_far(void *p) { void *volatile q = p; return q; }
 #endif
 
 #define FL_XIP(off)     FM1_XIP(off)              /* fm1_xip.h */
-#define FL_PLAIN_LO     0x00093000u                /* the unencrypted XIP window from here up (fl_plain_window_init) */
-#define FL_DATA_LO      0x00097000u                /* Felucca main store */
+/* the app area's end: the update loader writes [0x4000, FL_APP_END). 0x93000, or a firmware's bigger slot (its build
+ * defines FL_APP_END, a 4 KiB boundary up to 0xE0000): its code then runs past the old end, and the plain window, the
+ * store and XDATA0 start above it (XDATA0 empty from 0x97000 on) */
+#ifndef FL_APP_END
+#define FL_APP_END      0x00093000u
+#endif
+#define FL_DATA_LO      (FL_APP_END > 0x00097000u ? FL_APP_END : 0x00097000u)   /* Felucca main store */
+#define FL_PLAIN_LO     FL_APP_END                 /* the unencrypted XIP window from here up (fl_plain_window_init) */
 #define FL_DATA_HI      0x000E0000u
 #define FL_GLOB_LO      0x000FC000u                /* Felucca superblock / globals */
 #define FL_GLOB_HI      0x000FF000u
@@ -69,7 +75,7 @@ static inline void *fl_far(void *p) { void *volatile q = p; return q; }
  * record it finds at a 4 KiB boundary - 256 here invalid in place (ldr_core.c: "AT" at bytes 6..7 and a valid CRC;
  * its first bytes, 8 to 80, programmed to 0, the rest of the sector kept), so a firmware keeps bytes 0xF00..0xF07 of
  * each of these sectors erased (or anything but a record) */
-#define FL_XDATA0_LO    0x00093000u
+#define FL_XDATA0_LO    (FL_APP_END < 0x00097000u ? FL_APP_END : 0x00097000u)
 #define FL_XDATA0_HI    0x00097000u
 #define FL_XDATA1_LO    0x000E7000u
 #define FL_XDATA1_HI    0x000FC000u
