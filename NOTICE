@@ -29,6 +29,10 @@ they were first published under GPL-3.0-only by the same copyright holder. Each 
 message names the Felucca commit it was taken from. Releases of Felucca that already
 contain these files stay under GPL-3.0-only.
 
+The sliced sector erase (chip/fm1_flash_slice.h, tests/flash_slice_test.c, fl_erase4k_sliced and its window in
+chip/fm1_flash.h): Copyright (C) 2026 hdavid, from Optimist (https://github.com/w0ts/optimist, 54d89896), offered
+there under GPL-3.0-only OR MPL-2.0 (Optimist 25b17fc7) and taken here under MPL-2.0.
+
 Unofficial. Not affiliated with or endorsed by M-VAVE or JieLi.
 
 USB MIDI host (chip/usb_host.c, chip/usb_host_desc.h, the host additions in chip/fm1_usb.h,
