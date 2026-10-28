@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MPL-2.0
  * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments
+ * Copyright (C) 2026 hdavid (the sliced erase: fl_erase_window_ram, fl_erase4k_sliced and the hooks, from Optimist)
  * Written against the public JieLi AC79 SDK (Apache-2.0); see NOTICE. */
 /* FM-1 SPI NOR at runtime: erase / program / read. Used only when
  * FELUCCA_FLASH is 1.
@@ -9,6 +10,13 @@
  * libcalls, no XIP-resident helpers. Call the fl_*_ram() entry points with
  * interrupts disabled. Same sequence as the AC79 SDK flash driver
  * (cpu.a/vm_sfc.c.o: enter_spi_code, norflash_erase, norflash_wait_ok, exit_spi_code).
+ *
+ * The XIP side (below): fl_erase4k, a sector erase in one interrupts-off window (P25Q80H: 8 ms typical, 17 ms
+ * measured on an FM-1: the audio DMA loops its buffer meanwhile, so the caller silences it first), and fl_write, one
+ * window per 256-byte page. With FL_ERASE_SLICED 1, fl_erase4k_sliced too: the erase suspended and resumed in windows
+ * of about 1 ms (fm1_flash_slice.h), the interrupts on between them, so a firmware may erase while it plays.
+ * FM1_FLASH_ENTER() / FM1_FLASH_LEAVE(): the firmware's own step inside every window of these, after the interrupts
+ * are off and before they are on again (a second core taken off the flash, a measurement); none by default.
  */
 #pragma once
 #include <stdint.h>
@@ -35,7 +43,12 @@ static inline void *fl_far(void *p) { void *volatile q = p; return q; }
 #define CACHE_CON       REG32(0x1EEE008u)          /* b14 = cache idle */
 #define T4_CNT          REG32(0x10804u)            /* TIMER4, 24 MHz free-running */
 
+#ifndef FL_ERASE_SLICED
+#define FL_ERASE_SLICED 0                          /* 1: fl_erase4k_sliced (RAM code: only firmwares that ask pay for it) */
+#endif
+
 #define FL_XIP(off)     FM1_XIP(off)              /* fm1_xip.h */
+#define FL_PLAIN_LO     0x00093000u                /* the unencrypted XIP window from here up (fl_plain_window_init) */
 #define FL_DATA_LO      0x00097000u                /* Felucca main store */
 #define FL_DATA_HI      0x000E0000u
 #define FL_GLOB_LO      0x000FC000u                /* Felucca superblock / globals */
@@ -210,6 +223,35 @@ static RAMFN int fl_erase4k_ram(uint32_t off, uint32_t *took_us)
     return rc;
 }
 
+#if FL_ERASE_SLICED
+/* one window of a sector erase in short windows (fm1_flash_slice.h: fls_window, all of it inlined here: nothing it
+ * runs is in the flash). FLS_START issues the erase, FLS_RESUME resumes it; it runs for j->slice_us and is suspended,
+ * or ends. IRQs OFF, j in RAM */
+#define FLS_INL     RAMINL
+#define FLS_NOW()   T4_CNT
+#define FLS_SR1()   fl_rdsr(0x05)
+#define FLS_SR2()   fl_rdsr(0x35)
+#define FLS_ERASE(off) do { fl_cs(0); fl_tx(0x20); fl_addr(off); fl_cs(1); } while (0)
+#define FLS_CMD(c)  do { fl_cs(0); fl_tx((uint8_t)(c)); fl_cs(1); } while (0)
+#define FLS_INVAL(off) fl_inval(off, 4096u)
+#ifndef FLS_GAP                                    /* between two windows, the interrupts on and the XIP back */
+#define FLS_GAP()   do { uint32_t g0 = T4_CNT; while (T4_CNT - g0 < 20u * 24u) ; } while (0)   /* 20 us */
+#endif
+#define FLS_WINDOW_FN fl_erase_window
+#include "fm1_flash_slice.h"
+
+static RAMFN int fl_erase_window_ram(uint32_t off, uint32_t op, fls_job_t *j)
+{
+    fl_saved_t s; int rc;
+    if (!FL_RANGE_OK(off, 0x1000u) || (off & 0xFFFu))
+        return -1;
+    if (fl_enter(&s)) return -2;
+    rc = fls_window(off, op, j);
+    fl_exit(&s);
+    return rc;
+}
+#endif
+
 static RAMFN int fl_prog_ram(uint32_t off, const uint8_t *src, uint32_t n, uint32_t *took_us)
 {
     fl_saved_t s; int rc; uint32_t i;
@@ -247,24 +289,101 @@ static RAMFN int fl_read_ram(uint32_t off, uint8_t *dst, uint32_t n)   /* 0x0B f
 static void fl_plain_window_init(void)
 {
     SFCENC_CON &= (uint8_t)~2u;
-    SFCENC_UNENC_L = FL_XIP(0x93000u);            /* 0x0208F000 */
+    SFCENC_UNENC_L = FL_XIP(FL_PLAIN_LO);         /* 0x0208F000 */
     SFCENC_UNENC_H = 0x07FFFFFFu;
     SFCENC_CON |= 2u;
     __asm__ volatile("cli" ::: "memory");
-    fl_inval(0x93000u, 0x100000u - 0x93000u);     /* drop any decrypted lines */
+    fl_inval(FL_PLAIN_LO, 0x100000u - FL_PLAIN_LO);   /* drop any decrypted lines */
     __asm__ volatile("csync\n\tsti" ::: "memory");
 }
 
 static inline uint32_t irq_save(void) { __asm__ volatile("cli" ::: "memory"); return 0; }
 static inline void irq_restore(uint32_t f) { (void)f; __asm__ volatile("csync\n\tsti" ::: "memory"); }
 
+#ifndef FM1_FLASH_ENTER                            /* the firmware's step in each window, IRQs off (none by default) */
+#define FM1_FLASH_ENTER() ((void)0)
+#endif
+#ifndef FM1_FLASH_LEAVE                            /* and at its end, before the IRQs are on again */
+#define FM1_FLASH_LEAVE() ((void)0)
+#endif
+
 static int fl_erase4k(uint32_t off, uint32_t *took_us)
 {
     uint32_t f = irq_save();
-    int rc = FL_FAR(fl_erase4k_ram)(off, took_us);
+    int rc;
+    FM1_FLASH_ENTER();
+    rc = FL_FAR(fl_erase4k_ram)(off, took_us);
+    FM1_FLASH_LEAVE();
     irq_restore(f);
     return rc;
 }
+
+#if FL_ERASE_SLICED
+/* ---- a sector erase in short windows (fm1_flash_slice.h): suspended every FLS_SLICE_US (1 ms), the interrupts on
+ * between. Call it where an fl_erase4k is called, from the main loop (FLS_GAP turns the interrupts on), never from an
+ * interrupt.
+ *   - The interrupts that run between two windows run from the flash with the erase suspended: the part reads,
+ *     except the sector being erased (no code there; a read of that sector meanwhile gives anything).
+ *   - The XIP is off in each window, as in fl_write's: a second core running from the flash must have no job
+ *     outstanding when one starts (fm1_cpu1.h: the render waits for its job before it returns, so the main loop
+ *     never finds one; FM1_FLASH_ENTER can wait for it).
+ *   - The P25Q80H needs tERS >= 200 us between a resume and the next suspend to progress: FLS_SLICE_US >= 200.
+ *   - A part that does not suspend (or an erase that does not progress in FLS_SLICES_MAX windows) is waited out in one
+ *     window, as fl_erase4k: that window silences quiet[0..quiet_n) first (the audio buffer the DMA loops) and
+ *     FL_ERASE_HELD() says so. An erase that went through a suspend is read back blank through the plain window
+ *     (fl_plain_window_init); not blank, or no window: erased once more in one window (FL_ERASE_HELD() too).
+ *   - Each window is irq_save / FM1_FLASH_ENTER ... FM1_FLASH_LEAVE / irq_restore, as each page program.
+ * 0 = erased; < 0 as fl_erase4k (-1 range, -2 continuous-read XIP, -3 WEL not set, -4 never ready). took_us: the
+ * windows' time, summed (the longest one is about FLS_SLICE_US + 30 us). */
+#ifndef FL_ERASE_HELD                              /* an erase that held the interrupts off for the whole of it */
+#define FL_ERASE_HELD() ((void)0)
+#endif
+static int fl_erase_window(uint32_t off, uint32_t op, fls_job_t *j)
+{
+    uint32_t f, t;
+    int rc;
+    f = irq_save();
+    FM1_FLASH_ENTER();
+    t = T4_CNT;
+    j->windows++;
+    rc = FL_FAR(fl_erase_window_ram)(off, op, j);
+    j->took_us += (T4_CNT - t) / 24u;
+    FM1_FLASH_LEAVE();
+    irq_restore(f);
+    return rc;
+}
+static int fl_blank_xip(uint32_t off)              /* the sector reads all 0xFF through the plain window */
+{
+    const volatile uint32_t *p = (const volatile uint32_t *)FL_XIP(off);
+    uint32_t i;
+    for (i = 0; i < 1024u; i++)
+        if (p[i] != 0xFFFFFFFFu)
+            return 0;
+    return 1;
+}
+static int fl_erase4k_sliced(uint32_t off, uint32_t *took_us, int32_t *quiet, uint32_t quiet_n)
+{
+    fls_job_t j = { FLS_SLICE_US, quiet, quiet_n, 0, 0, 0, 0 };   /* (volatile: the DMA reads it) */
+    int rc;
+    if (!FL_RANGE_OK(off, 0x1000u) || (off & 0xFFFu))
+        return -1;
+    rc = fls_erase(off, &j);
+    if (j.held)
+        FL_ERASE_HELD();
+    if (!rc && j.windows > 1u && !((SFCENC_CON & 2u) && off >= FL_PLAIN_LO && fl_blank_xip(off))) {
+        fls_job_t k = { 0, quiet, quiet_n, 0, 0, 0, 0 };
+        FL_ERASE_HELD();
+        rc = fl_erase_window(off, FLS_RESUME, &k);   /* (an erase still suspended: ended first; a part idle ignores it) */
+        if (rc >= 0) {
+            k.held = 0;                           /* (silenced again: a half may have been rendered since) */
+            rc = fls_erase(off, &k);              /* (then once more in one window, as fl_erase4k) */
+        }
+        j.took_us += k.took_us;
+    }
+    *took_us = j.took_us;
+    return rc < 0 ? rc : 0;
+}
+#endif
 
 static int fl_write(uint32_t off, const uint8_t *src_ram, uint32_t n)
 {
@@ -275,7 +394,9 @@ static int fl_write(uint32_t off, const uint8_t *src_ram, uint32_t n)
         uint32_t f;
         if (chunk > n) chunk = n;
         f = irq_save();
+        FM1_FLASH_ENTER();
         rc = FL_FAR(fl_prog_ram)(off, src_ram, chunk, &took);
+        FM1_FLASH_LEAVE();
         irq_restore(f);
         if (rc) return rc;
         off += chunk; src_ram += chunk; n -= chunk;
