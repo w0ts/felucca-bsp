@@ -52,3 +52,25 @@ Kerem licenses his contributions to this port under MPL-2.0 as well. The origina
 Melodee copies remain GPL-3.0-only. chip/usb.c retains Felucca's device code, with new
 MPL-2.0 integration by Kerem Kilic. The host's register sequences follow the public
 AC79 SDK; no SDK implementation source is copied into this port.
+
+The Bluetooth radio drivers (chip/fm1_ble.h, chip/fm1_ble_rf.h, chip/fm1_bredr.h) come from Optimist
+(https://github.com/w0ts/optimist) by Henri David (hdavid), offered under GPL-3.0-only OR MPL-2.0
+(https://github.com/w0ts/optimist/issues/55) and taken here under MPL-2.0. chip/ble_rf_tables_v15.h is
+Apache-2.0: the radio start-up writes of M-VAVE's stock FM-1 V15 firmware (Copyright (c) 2026 Zhuhai Shengke /
+M-VAVE, Apache-2.0 in https://github.com/m-vave/fm1_open), which are JieLi's rf_init (wl_rf_common.a,
+btctrler.a; Copyright (c) 2024-2026 Zhuhai Jieli Technology Co., Ltd., Apache-2.0 in its AC79 AIoT SDK,
+https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK), recorded in an emulator and packed by Optimist; its header
+states the changes (Apache-2.0 section 4(b)). A firmware built with it ships LICENSES/Apache-2.0.txt.
+
+chip/fm1_rf_cal.h is Apache-2.0: the 2.4 GHz radio's calibration (the VCO bank scan, the RX filter, TX LO and RX DC
+trims) rewritten in C from JieLi's wl_rf_common.a (Copyright (c) 2024-2026 Zhuhai Jieli Technology Co., Ltd.,
+Apache-2.0 in its AC79 AIoT SDK, https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK); its header states the changes
+(Apache-2.0 section 4(b)).
+
+The Wi-Fi MAC driver (chip/fm1_wifi.h) comes from Optimist by Henri David (hdavid), offered under GPL-3.0-only OR
+MPL-2.0 (the same offer as the Bluetooth radio drivers) and taken here under MPL-2.0; its header keeps both. It was
+written after reading JieLi's Apache-2.0 Wi-Fi driver libraries of the AC79 SDK (as LLVM IR) and running them in an
+emulator to record their register writes: no vendor code is copied, the register addresses and values it uses are
+JieLi's facts. chip/fm1_wifi_wlc.h is Apache-2.0: the coexistence controller's set-up words JieLi's wlc.c writes when
+Wi-Fi starts (cpu.a; Copyright (c) 2024-2026 Zhuhai Jieli Technology Co., Ltd., Apache-2.0 in its AC79 AIoT SDK),
+recorded in an emulator and packed by Optimist; its header states the changes (Apache-2.0 section 4(b)).
