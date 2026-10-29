@@ -2,7 +2,8 @@
 
 Status of the advanced features planned for this repository. **Beta**: the second core (runs in Melodee;
 this version not yet on a device), expanded flash (code exists, never run on a device), the sliced sector erase
-(code and a host test, never run on a device), and USB MIDI host
+(code and a host test, never run on a device), the cache RAM (code and a host test; Optimist's own copy runs on an
+FM-1), and USB MIDI host
 (input runs in Melodee; this BSP port and output need device validation). **Concept**: the clock (nothing runs).
 Each item says what is established, what is guessed, and what the first bench test is. All of it stays behind
 explicit calls: no firmware starts any of it by itself.
@@ -45,6 +46,20 @@ between windows); with a second core, no job of it outstanding (the XIP is off i
 program). First test: a firmware that erases a data sector while it plays a held note, with the longest
 interrupts-off window measured (TIMER4 around `irq_save` / `irq_restore`, or `FM1_FLASH_ENTER` / `FM1_FLASH_LEAVE`):
 about 1 ms, the note unbroken, `FL_ERASE_HELD()` never called, the sector blank.
+
+## Cache RAM: `chip/fm1_cache_ram.h`
+
+From Optimist (hdavid, under MPL-2.0: `NOTICE`), behind an explicit `fm1_cache_ram_init(ways)` at the start. 1 to 7 of
+the 8 data-cache ways (4 KiB each, at 0x01F28000 + way x 4 KiB) become plain RAM, with the AC79 SDK's sequence
+(`cache_way_config`, as M-VAVE's V15 runs it with 7 ways: the masks, every tag invalid, from RAM with the cache off),
+then a memory test (address patterns and their complements) before anything uses them; a failure puts the masks back
+and leaves 0 bytes (`fm1_cache_ram_bytes`). Established on one FM-1 by Optimist's own copy (2026-10-18 .. 25): the test
+passes, the memory reads as fast as main RAM, 2 ways in daily use for days without a fault; with 7 ways flash data
+reads over 16 KiB are 57x slower (the flash's data goes through this cache), so fewer ways are the safer choice. Done
+here: the logic on a model of the registers (`tests/cache_ram_test.c`: 2, 4 and 7 ways, the failures). Not
+established: whether the second core and DMA read the ways (the registers are one set for the corex2 cluster, and the
+SDK's dual-core OS keeps its tables there, but neither has been measured); this file's own run on a device. First
+test: a firmware with 2 ways that reads back `fm1_cr.status` 1 and `fm1_cache_ram_bytes()` 8192.
 
 ## USB host
 
