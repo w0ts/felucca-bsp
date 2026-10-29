@@ -31,7 +31,8 @@ for flags in "" "-DTEST_OUT=0" "-DTEST_CH=4 -DTEST_24=1" "-DTEST_CH=4 -DTEST_24=
              "-DTEST_HC=1 -DTEST_CH=8 -DTEST_OUT=0" "-DTEST_FB=1" "-DTEST_FB=1 -DTEST_CH=4 -DTEST_24=1" \
              "-DTEST_FB=1 -DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1" "-DTEST_O24=1" "-DTEST_FB=1 -DTEST_O24=1" \
              "-DTEST_FB=1 -DTEST_O24=1 -DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1" "-DTEST_SPLIT=1" \
-             "-DTEST_SPLIT=1 -DTEST_NAMES=1" "-DTEST_SPLIT=1 -DTEST_OUT=0" \
+             "-DTEST_SPLIT=1 -DTEST_NAMES=1" "-DTEST_SPLIT=1 -DTEST_OUT=0" "-DTEST_SPLIT=1 -DTEST_NAMEFN=1" \
+             "-DTEST_SPLIT=1 -DTEST_NAMEFN=1 -DTEST_OUT=0 -DTEST_CH=4" "-DTEST_NAMEFN=1" \
              "-DTEST_SPLIT=1 -DTEST_NAMES=1 -DTEST_FB=1 -DTEST_O24=1 -DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1"; do
     # Word splitting is intentional for the fixed compiler options above.
     "${CC:-cc}" -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function \
