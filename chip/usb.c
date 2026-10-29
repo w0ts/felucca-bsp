@@ -481,7 +481,11 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #define FELUCCA_CDC_DEFAULT 1
 #endif
 /* FELUCCA_USB_MANUFACTURER, FELUCCA_USB_PRODUCT: optional ASCII strings for the USB names (string
- * descriptors 1 and 2); without them the Hügelton / Felucca names below. */
+ * descriptors 1 and 2); without them the Hügelton / Felucca names below.
+ * FELUCCA_USB_NAME_FN: the name of a function `const char *fn(void)` the product name is asked of each time a host reads it
+ * (string 2, the MIDI device and its ports; with FELUCCA_UAC_SPLIT that name + " In" / " Out", unless FELUCCA_UAC_IN_NAME /
+ * FELUCCA_UAC_OUT_NAME say otherwise): for a name that carries something of this device (its address), known only at
+ * run time. ASCII, at most 25 characters (a name + " Out" is 31 at most); NULL or "" = FELUCCA_USB_PRODUCT / the default. */
 #ifndef FELUCCA_USB_PID
 #define FELUCCA_USB_PID 0x0001   /* the update loader is 0x0002 */
 #endif
@@ -532,14 +536,14 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #else
 #define UA_STR_CH 0
 #endif
-#ifndef FELUCCA_UAC_IN_NAME
+#if !defined(FELUCCA_UAC_IN_NAME) && !defined(FELUCCA_USB_NAME_FN)
 #ifdef FELUCCA_USB_PRODUCT
 #define FELUCCA_UAC_IN_NAME FELUCCA_USB_PRODUCT " In"
 #else
 #define FELUCCA_UAC_IN_NAME "Felucca In"
 #endif
 #endif
-#ifndef FELUCCA_UAC_OUT_NAME
+#if !defined(FELUCCA_UAC_OUT_NAME) && !defined(FELUCCA_USB_NAME_FN)
 #ifdef FELUCCA_USB_PRODUCT
 #define FELUCCA_UAC_OUT_NAME FELUCCA_USB_PRODUCT " Out"
 #else
@@ -760,19 +764,26 @@ static const uint8_t STR2[] = {30, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c
 static const uint8_t STR2[] = {16, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c', 0, 'a', 0};
 #endif
 
-#if defined(FELUCCA_USB_MANUFACTURER) || defined(FELUCCA_USB_PRODUCT) || FELUCCA_UAC_SPLIT
+#if defined(FELUCCA_USB_MANUFACTURER) || defined(FELUCCA_USB_PRODUCT) || defined(FELUCCA_USB_NAME_FN) || FELUCCA_UAC_SPLIT
+#ifdef FELUCCA_USB_NAME_FN
+extern const char *FELUCCA_USB_NAME_FN(void);
+#endif
 /* A string descriptor built from a plain ASCII string (the build settings FELUCCA_USB_MANUFACTURER and
- * FELUCCA_USB_PRODUCT, e.g. -DFELUCCA_USB_PRODUCT='"CTL-1 FM-1"'), at most 31 characters. EP0 sends one
- * descriptor at a time, so one buffer serves both. */
+ * FELUCCA_USB_PRODUCT, e.g. -DFELUCCA_USB_PRODUCT='"CTL-1 FM-1"'), at most 31 characters, and a suffix after it
+ * (usb_str_desc2: " In" after a name asked at run time). EP0 sends one descriptor at a time, so one buffer serves all. */
 static uint8_t usb_str_buf[2 + 2 * 31];
 
-static int usb_str_desc(const char *s, const uint8_t **d, uint16_t *l)
+static int usb_str_desc2(const char *s, const char *tail, const uint8_t **d, uint16_t *l)
 {
-    uint32_t n = 0;
-    while (s[n] && n < 31u) {
-        usb_str_buf[2 + 2 * n] = (uint8_t)s[n];
+    uint32_t n = 0, k = 0;
+    while (s[k] && n < 31u) {
+        usb_str_buf[2 + 2 * n] = (uint8_t)s[k++];
         usb_str_buf[3 + 2 * n] = 0;
         n++;
+    }
+    for (k = 0; tail[k] && n < 31u; k++, n++) {
+        usb_str_buf[2 + 2 * n] = (uint8_t)tail[k];
+        usb_str_buf[3 + 2 * n] = 0;
     }
     usb_str_buf[0] = (uint8_t)(2 + 2 * n);
     usb_str_buf[1] = 3;
@@ -780,6 +791,21 @@ static int usb_str_desc(const char *s, const uint8_t **d, uint16_t *l)
     *l = (uint16_t)(2 + 2 * n);
     return 1;
 }
+
+#define usb_str_desc(s, d, l) usb_str_desc2((s), "", (d), (l))
+#ifdef FELUCCA_USB_NAME_FN
+static const char *usb_product_name(void)    /* the function's name, else FELUCCA_USB_PRODUCT, else the default */
+{
+    const char *n = FELUCCA_USB_NAME_FN();
+    if (n && n[0])
+        return n;
+#ifdef FELUCCA_USB_PRODUCT
+    return FELUCCA_USB_PRODUCT;
+#else
+    return "Felucca";
+#endif
+}
+#endif
 #endif
 
 #if FELUCCA_UAC_SPLIT && defined FELUCCA_UAC_CH_NAMES
@@ -812,7 +838,9 @@ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
             return 1;
 #endif
         case 2:
-#ifdef FELUCCA_USB_PRODUCT
+#ifdef FELUCCA_USB_NAME_FN
+            return usb_str_desc(usb_product_name(), d, l);
+#elif defined(FELUCCA_USB_PRODUCT)
             return usb_str_desc(FELUCCA_USB_PRODUCT, d, l);
 #else
             *d = STR2;
@@ -821,10 +849,18 @@ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
 #endif
 #if FELUCCA_UAC_SPLIT
         case UA_STR_IN:
+#ifdef FELUCCA_UAC_IN_NAME
             return usb_str_desc(FELUCCA_UAC_IN_NAME, d, l);
+#else
+            return usb_str_desc2(usb_product_name(), " In", d, l);
+#endif
 #if FELUCCA_UAC_OUT
         case UA_STR_OUT:
+#ifdef FELUCCA_UAC_OUT_NAME
             return usb_str_desc(FELUCCA_UAC_OUT_NAME, d, l);
+#else
+            return usb_str_desc2(usb_product_name(), " Out", d, l);
+#endif
 #endif
 #endif
         default:
