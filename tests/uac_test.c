@@ -64,6 +64,9 @@
 #ifndef TEST_SPLIT
 #define TEST_SPLIT 0                                    /* FELUCCA_UAC_SPLIT */
 #endif
+#ifndef TEST_NAMEFN
+#define TEST_NAMEFN 0                                   /* with it: FELUCCA_USB_NAME_FN gives "FM1-1A2B" (the product, " In", " Out") */
+#endif
 #ifndef TEST_NAMES
 #define TEST_NAMES 0                                    /* with it: the names given */
 #endif
@@ -162,6 +165,10 @@ static void fm1_delay_ms(uint32_t ms) { (void)ms; }
 #elif TEST_CH == 4
 #define FELUCCA_UAC_CH_NAMES "CH1", "CH2", "CH3", "CH4"
 #endif
+#endif
+#if TEST_NAMEFN
+const char *test_name_fn(void) { return "FM1-1A2B"; }       /* FELUCCA_USB_NAME_FN: the name asked at run time */
+#define FELUCCA_USB_NAME_FN test_name_fn
 #endif
 #define FELUCCA_CDC TEST_CDC
 #define FELUCCA_OTA 0
@@ -318,7 +325,8 @@ static void test_descriptors(void)
         assert((dv[12] & 0x08u) == 0x08u);
         for (k = 3; k < 16u; k++) {
             int has = get_desc(0x0300 | k, &sd, &sl);
-            const char *w = !TEST_NAMES ? (k == 3 ? "Felucca In" : k == 4 && TEST_OUT ? "Felucca Out" : 0)
+            const char *w = !TEST_NAMES ? (TEST_NAMEFN ? (k == 3 ? "FM1-1A2B In" : k == 4 && TEST_OUT ? "FM1-1A2B Out" : 0)
+                                                       : (k == 3 ? "Felucca In" : k == 4 && TEST_OUT ? "Felucca Out" : 0))
                           : k == 3 ? want[0] : k == 4 ? (TEST_OUT ? want[1] : 0)
                           : k - 5u < TEST_CH ? want[(TEST_CH == 2 ? 2u : 4u) + k - 5u] : 0;
             uint32_t j;
@@ -329,6 +337,16 @@ static void test_descriptors(void)
             for (j = 0; w[j]; j++)
                 assert(sd[2 + 2 * j] == (uint8_t)w[j] && sd[3 + 2 * j] == 0);
         }
+    }
+#endif
+#if TEST_NAMEFN
+    {   /* the product string (the MIDI device and its ports) is the function's, whole */
+        const uint8_t *sd;
+        uint16_t sl;
+        uint32_t j;
+        assert(get_desc(0x0302, &sd, &sl) && sd[1] == 3 && sl == sd[0] && sl == 2u + 2u * 8u);
+        for (j = 0; j < 8u; j++)
+            assert(sd[2 + 2 * j] == (uint8_t)"FM1-1A2B"[j] && sd[3 + 2 * j] == 0);
     }
 #endif
     assert(it_ok && alts == 1u + TEST_24);
