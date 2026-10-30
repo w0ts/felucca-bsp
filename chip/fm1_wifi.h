@@ -16,7 +16,7 @@
  *   fm1_wifi_is_up()              .. its RF path is on
  *   fm1_wifi_set_channel(ch)      1..13 (byte 0 of 0x1405C = channel + 101)
  *   fm1_wifi_rx(buf, max)         one received frame by the RX DMA: RXWI (16 B) then the 802.11 frame
- *   fm1_wifi_tx_prepare / _tx     one frame out by the TX DMA (a TXWI before it)
+ *   fm1_wifi_tx_prepare / _tx     one frame out by the TX DMA (a TXWI before it; _prepare_rate: at a rate, FM1_WIFI_RATE_*)
  *   fm1_wifi_mac_rd / _wr         a MAC register; the key tables' places below (FM1_WIFI_WCID_* ...) */
 #pragma once
 #include <stdint.h>
@@ -51,13 +51,25 @@
  * Protected bit set is encrypted by the MAC with the WCID's key (CCMP; the IV / EIV from the WCID's table); a frame
  * at a WCID with no key goes out as it is. ack 1: the MAC waits for the receiver's ACK and retries (0 for beacons and
  * group frames). WCID 0 is the MAC's drop entry: never used */
-FM1_INLINE void fm1_wifi_tx_prepare(uint32_t *buf, uint32_t mpdu_len, uint32_t wcid, uint32_t ack)
+FM1_INLINE void fm1_wifi_tx_prepare_rate(uint32_t *buf, uint32_t mpdu_len, uint32_t wcid, uint32_t ack, uint32_t w0)
 {
     buf[0] = mpdu_len + 22u;
     buf[1] = 4u;
-    buf[2] = 0xB0u;
+    buf[2] = w0;
     buf[3] = (ack & 1u) | 13u << 2 | (wcid & 0xFFu) << 8 | (mpdu_len & 0xFFFu) << 16;
     buf[4] = buf[5] = 0;
+}
+/* TXWI word 0 (Ralink's _TXWI_STRUC, the SDK's debug info in wl_wifi_sta.a cmm_data.c: MCS [22:16], PHYMODE [31:30], 0 CCK,
+ * 1 OFDM; bits 4-7 the SDK's own 0xB0, kept): the CCK MCS 0..3 = 1, 2, 5.5, 11 Mb/s (long preamble), the OFDM MCS 0..7 =
+ * 6 .. 54 Mb/s. JieLi's rate table (wl_usb_to_sdio.c mcs_mode_tab, wifi_set_tx_rate_control_tab) runs CCK 1M, CCK 2M,
+ * CCK 5.5M, OFDM 6M, .. in that order */
+#define FM1_WIFI_TXWI(phy, mcs) (0xB0u | ((uint32_t)(mcs) & 0x7Fu) << 16 | ((uint32_t)(phy) & 3u) << 30)
+#define FM1_WIFI_RATE_CCK1 FM1_WIFI_TXWI(0, 0)   /* 0xB0: every frame until fm1-base's Wi-Fi tuning */
+#define FM1_WIFI_RATE_CCK2 FM1_WIFI_TXWI(0, 1)
+#define FM1_WIFI_RATE_OFDM6 FM1_WIFI_TXWI(1, 0)
+FM1_INLINE void fm1_wifi_tx_prepare(uint32_t *buf, uint32_t mpdu_len, uint32_t wcid, uint32_t ack)
+{
+    fm1_wifi_tx_prepare_rate(buf, mpdu_len, wcid, ack, FM1_WIFI_RATE_CCK1);
 }
 /* the frame fm1_wifi_tx_prepare set up, out; 0, or -1 if the DMA did not finish within 10 ms (one frame at a time) */
 FM1_INLINE int fm1_wifi_tx(uint32_t *buf)
@@ -93,6 +105,33 @@ FM1_INLINE uint32_t fm1_wifi_rd(uint32_t a) { return *(const volatile uint32_t *
 #define FM1_WIFI_ADDR_BSSID 0x1010u      /* the BSSID: bytes 0-3, then 4-5 */
 #define FM1_WIFI_RX_FILTER 0x1400u       /* Ralink's RX_FILTR_CFG (bit n set = drop that kind) */
 #define FM1_WIFI_RX_FILTER_ALL 0x1u      /* .. drop only frames with a bad CRC */
+/* .. Ralink's STANORMAL, the SDK's STA driver's (wl_wifi_sta.a, written in fm1_wifi_sta_init): dropped are bad CRC (bit 0), PHY
+ * errors (1), unicast not to our address (2: 0x1008, all six bytes compared, 0x100C [23:16] 0xFF), a wrong version (4),
+ * retried duplicates (7), and the control frames: CF-End+ACK, CF-End, ACK, CTS, RTS, PS-Poll, BA, the rest (8-14, 16; the
+ * MAC takes the ACK of its own frames itself: the host never needs them). Kept: other networks' frames (3 clear), multicast
+ * (5 clear: Link's group), broadcast (6 clear: ARP, DHCP), BAR (15) */
+#define FM1_WIFI_RX_FILTER_STA 0x17F97u
+/* The MAC's own retries step down a rate each (TX_RTY_CFG 0x134C bit 30, TX_AUTO_FB_ENABLE: set in fm1_wifi_sta_init's
+ * 0x47D01F0F; the retry limits [7:0] 15, [15:8] 31) by the legacy fallback tables, Ralink's LG_FBK_CFG0 (0x135C, nibble i:
+ * where OFDM rate i goes, 8 + its index) and LG_FBK_CFG1 (0x1360, nibble i: where CCK rate i goes). JieLi's values with every
+ * rate allowed (wl_usb_to_sdio.c wifi_set_tx_rate_control_tab: rate i to the next lower one allowed, the lowest to itself;
+ * read-modify-write of the low 32 / 16 bits): CCK 2M retries at 1M; OFDM 6M at 6M (it never falls to CCK) */
+#define FM1_WIFI_LG_FBK0 0x135Cu
+#define FM1_WIFI_LG_FBK1 0x1360u
+#define FM1_WIFI_LG_FBK0_SDK 0xEDCBA988u
+#define FM1_WIFI_LG_FBK1_SDK 0x00002100u
+FM1_INLINE void fm1_wifi_fallback_sdk(void)
+{
+    fm1_wifi_mac_wr(FM1_WIFI_LG_FBK0, FM1_WIFI_LG_FBK0_SDK);
+    fm1_wifi_mac_wr(FM1_WIFI_LG_FBK1, (fm1_wifi_mac_rd(FM1_WIFI_LG_FBK1) & ~0xFFFFu) | FM1_WIFI_LG_FBK1_SDK);
+}
+/* The receiver's highest AGC gain: entry 44 of the BBP's window C ("cca"), JieLi's adj_agc_max_gain (wl_rf_common.a
+ * wf_soft_adj.c: cca_reg_set(44, g), i.e. window C's three BBP writes) by the joined AP's signal: above -36 dBm 34, above -46 43,
+ * above -60 51, above -76 57, else 66; 66 when nothing from the AP was heard for 220 ms (wl_hw_init.c WifiRecvPkgHook,
+ * agc_adj_interval 2 x 110 ms). The start-up program writes 66 there (ble_rf_prog's window write C[44]), the SDK's first value too */
+#define FM1_WIFI_AGC_WIN 0u
+#define FM1_WIFI_AGC_ENTRY 44u
+#define FM1_WIFI_AGC_START 66u
 #define FM1_WIFI_WCID_ADDR(w) (0x1800u + 8u * (w))   /* WCID w's peer address: bytes 0-3, then 4-5 */
 #define FM1_WIFI_PKEY(w) (0x4000u + 32u * (w))       /* its pairwise key (16 B, then 16 B of MIC keys: 0 for CCMP) */
 #define FM1_WIFI_IVEIV(w) (0x6000u + 8u * (w))       /* its TX IV and EIV: ((key id << 6 | 0x20 ExtIV) << 24) | PN */
