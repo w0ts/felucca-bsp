@@ -15,6 +15,8 @@
  *   2c. with LDR_SLOT_SWITCH (an app whose slot size is set: FL_APP_END), when the installed app's area ends
  *      elsewhere: going down, erases the old app's code above this one's end (it would read as data); going up,
  *      erases [FL_APP_END, LDR_CLEAR_END) when the app sets it (the data a smaller app kept where this one's now is);
+ *      with LDR_STEPS (the app's list of every end it may have, each its step and store top) the app's one rule
+ *      for every pair instead (ldr_steps_range);
  *   3. writes ONLY the app area [0x4000, FL_APP_END) (0x93000, or the app's bigger slot), sector by sector, skipping
  *      sectors that are already equal, and verifies each one; a sector that
  *      comes in different from the checked pass is read again, never written;
@@ -118,12 +120,56 @@ static int ldr_check(uint32_t fl_off, uint32_t fl_size, uint32_t want, uint16_t 
 /* 2c. the installed app's slot against this one's (before anything is written, so a resumed install, the old head
  * still there, does the same): its end from its app area head (0x4000, the chip key's cipher: the block it heads, as
  * fm1pkg_make.py writes it, rounded up to a sector); no head of that format: nothing cleared */
+#ifdef LDR_STEPS
+/* an app with steps (its fm1.toml app_steps: every app end it may have been installed with, each its step and R, the
+ * top of what that step keeps elsewhere than the normal one; tools/build.py passes them): one rule for every pair,
+ * the app's own (Optimist's docs/SD-MODE-DESIGN.md 9.3). This app (end FL_APP_END, step LDR_STEP, its R LDR_RELOC_HI)
+ * over an app of another step erases [FL_APP_END, max(R_old, LDR_RELOC_HI)); over another build of its own step only
+ * the old code's tail [FL_APP_END, old end); the same end nothing. No head of that format, or an end not listed at or
+ * below the list's first (the normal) step's: as after that step. An end not listed above it: [FL_APP_END,
+ * LDR_CLEAR_TOP), the safe side. Never at or past
+ * LDR_CLEAR_TOP */
+#if !defined(LDR_STEP) || !defined(LDR_RELOC_HI) || !defined(LDR_CLEAR_TOP)
+#error "LDR_STEPS needs LDR_STEP, LDR_RELOC_HI and LDR_CLEAR_TOP (tools/build.py, the app's app_steps)"
+#endif
+_Static_assert(LDR_RELOC_HI >= FL_APP_END && LDR_RELOC_HI <= LDR_CLEAR_TOP && LDR_CLEAR_TOP <= LDR_DATA_HI,
+               "the step's store: above its app, below the clear's top");
+#define LDR_STEP_OF(e, l, r) if (end == (e)) old_l = (int)(l), old_r = (r);
+#define LDR_STEP_FIRST(e, l, r) if (first_l < 0) first_e = (e), first_l = (int)(l), first_r = (r);
+static void ldr_steps_range(uint32_t end, uint32_t *lo, uint32_t *hi)   /* end: the installed area's, 0 no head */
+{
+    int old_l = -1, first_l = -1;
+    uint32_t old_r = LDR_CLEAR_TOP, first_e = 0, first_r = 0;
+    LDR_STEPS(LDR_STEP_FIRST)
+    LDR_STEPS(LDR_STEP_OF)
+    if (old_l < 0 && end <= first_e)                 /* (no head, or an end no slot has below the first step's: as
+                                                      * after the first, normal, step) */
+        old_l = first_l, old_r = first_r;
+    *lo = *hi = 0;
+    if (end == LDR_APP_HI)
+        return;
+    if (old_l == (int)LDR_STEP) {
+        if (end > LDR_APP_HI)
+            *lo = LDR_APP_HI, *hi = end;             /* (another build of this step: its longer code) */
+        return;
+    }
+    *hi = old_r > LDR_RELOC_HI ? old_r : LDR_RELOC_HI;
+    if (*hi > LDR_CLEAR_TOP)
+        *hi = LDR_CLEAR_TOP;
+    *lo = *hi > LDR_APP_HI ? LDR_APP_HI : *hi;
+}
+#endif
+
 static int ldr_slot_switch(uint32_t key, uint8_t *b)
 {
     uint32_t end, s, lo = 0, hi = 0;
     if (ldr_fread(LDR_APP_LO, b, 32))
         return -8;
     ldr_sfc(b, 32, 0, key);
+#ifdef LDR_STEPS
+    end = ota_crc16(b + 2, 30, 0) == ota_rd16(b) ? (LDR_APP_LO + ota_rd32(b + 8) + 0xFFFu) & ~0xFFFu : 0u;
+    ldr_steps_range(end, &lo, &hi);
+#else
     if (ota_crc16(b + 2, 30, 0) != ota_rd16(b))
         return 0;
     end = (LDR_APP_LO + ota_rd32(b + 8) + 0xFFFu) & ~0xFFFu;
@@ -132,6 +178,7 @@ static int ldr_slot_switch(uint32_t key, uint8_t *b)
 #ifdef LDR_CLEAR_END
     else if (end < LDR_APP_HI)
         lo = LDR_APP_HI, hi = LDR_CLEAR_END;         /* (a smaller app's data where this one keeps its own) */
+#endif
 #endif
     for (s = lo; s < hi; s += 0x1000u)
         if (ldr_erase(s))
