@@ -24,6 +24,13 @@
 
 #define RAMFN  __attribute__((section(".ram_text"), noinline, used))
 #define RAMINL static inline __attribute__((always_inline))
+/* RAM code only the update loader calls (fl_status_ram, the erase while it receives): kept in the loader (FELUCCA_LOADER)
+ * as every RAMFN is (used); in an app without used, so the compiler drops it unless the app calls it (1.3 KB of RAM) */
+#ifdef FELUCCA_LOADER
+#define RAMFN_LDR RAMFN
+#else
+#define RAMFN_LDR __attribute__((section(".ram_text"), noinline))
+#endif
 
 /* XIP (0x02xxxxxx) -> RAM (0x01C0xxxx) is beyond the 23-bit call range:
  * call RAM code through a pointer the compiler cannot fold back. */
@@ -204,7 +211,7 @@ static RAMFN int fl_uid_ram(uint8_t *dst)
 }
 #endif
 
-static RAMFN uint32_t fl_status_ram(void)                /* SR1 | SR2 << 8 */
+static RAMFN_LDR uint32_t fl_status_ram(void)                /* SR1 | SR2 << 8 */
 {
     fl_saved_t s; uint32_t v;
     if (fl_enter(&s)) return 0xFFFFFFFFu;
@@ -233,7 +240,7 @@ static RAMFN int fl_erase4k_ram(uint32_t off, uint32_t *took_us)
 /* the update loader's erase while it receives (loader/ldr_core.c, the fast install): begin sends 20h and leaves the XIP
  * off, as fl_erase4k_ram does while it waits; the loader runs from RAM and only polls USB until end, which waits the
  * erase out and gives the XIP back. Between the two nothing may touch the flash */
-static RAMFN int fl_erase4k_begin_ram(uint32_t off, fl_saved_t *s)
+static RAMFN_LDR int fl_erase4k_begin_ram(uint32_t off, fl_saved_t *s)
 {
     if (!FL_RANGE_OK(off, 0x1000u) || (off & 0xFFFu))
         return -1;
@@ -247,7 +254,7 @@ static RAMFN int fl_erase4k_begin_ram(uint32_t off, fl_saved_t *s)
     fl_inval(off, 4096u);
     return 0;
 }
-static RAMFN int fl_erase4k_end_ram(const fl_saved_t *s, uint32_t *took_us)
+static RAMFN_LDR int fl_erase4k_end_ram(const fl_saved_t *s, uint32_t *took_us)
 {
     int rc = fl_wait_ready(500000u, took_us);     /* generic NOR max 400 ms */
     fl_exit(s);
