@@ -1039,6 +1039,94 @@ static void test_mem_unlent(const char *when)
     printf("USB audio rings not lent (%s): %u silence packets, nothing captured or played, nothing counted: OK\n", when,
            pkts);
 }
+/* the lend as the device does it: the computer streams first (alt set, reading silence packets), the block arrives a main
+ * loop pass later, mid-stream; later taken back mid-stream (its question's NO) and lent again; then the computer stops
+ * reading for 30 ms before it sets alt 0 (a recorder closing), and the block goes back. The counters of each phase */
+static void test_mem_midstream(void)
+{
+    static int32_t blk[HALF_FRAMES * 8u];
+    uint32_t ms, acc = 0, i, c, f = 0, t = 0, reading = 1, ph = 0;
+    uint32_t u0 = uac.underruns, o0 = uac.overruns;
+#if TEST_OUT
+    static int32_t lr[2u * HALF_FRAMES];
+    uint32_t pu0 = uo.underruns, po0 = uo.overruns;
+#endif
+    static const char *const PH[] = {"unlent, streaming", "lent mid-stream", "taken back mid-stream", "lent again",
+                                     "a 12 ms pause both ways, then on (a real gap)", "on again",
+                                     "the computer stops reading", "alt 0, taken back"};
+    uint32_t cu[8] = {0}, co[8] = {0}, pu[8] = {0}, pu_at = 0;
+#if TEST_OUT
+    pu_at = pu0;
+#endif
+    usb_start();
+    setup(0x00, 9, 1, 0);
+    setup(0x01, 11, 1, UAC_AS_IF);
+#if TEST_OUT
+    setup(0x01, 11, 1, UAC_ASO_IF);
+    host_play_start();
+#endif
+    for (ms = 0; ms < 2600u; ms++) {
+        uint32_t nph = ms < 100u ? 0u : ms < 1100u ? 1u : ms < 1300u ? 2u : ms < 1700u ? 3u : ms < 1800u ? 4u : ms < 2300u ? 5u :
+                       ms < 2330u ? 6u : 7u;
+        uint32_t paused = ms >= 1700u && ms < 1712u;
+        if (nph != ph) {
+            cu[ph] = uac.underruns - u0, co[ph] = uac.overruns - o0;
+            u0 = uac.underruns, o0 = uac.overruns;
+#if TEST_OUT
+            pu[ph] = uo.underruns - pu_at, pu_at = uo.underruns;
+#endif
+            ph = nph;
+            if (ph == 1u || ph == 3u)
+                mem_lend();
+            else if (ph == 2u)
+                mem_back();
+            else if (ph == 6u)
+                reading = 0;
+            else if (ph == 7u) {
+                setup(0x01, 11, 0, UAC_AS_IF);
+#if TEST_OUT
+                setup(0x01, 11, 0, UAC_ASO_IF);
+#endif
+                mem_back();
+            }
+        }
+        if (reading && !paused && (regs[4][17] & 1u))
+            regs[4][17] = 0;                            /* (the host takes the packet) */
+#if TEST_OUT
+        if (ph < 6u && !paused)
+            host_out(host_play_n(ms, 0), &t);
+#endif
+        usb_poll();
+        usb_poll();
+        for (acc += 441176u; acc >= HALF_FRAMES * 10000u; acc -= HALF_FRAMES * 10000u) {
+            uac_render_start();
+            if (uac_capturing()) {
+                for (i = 0; i < HALF_FRAMES; i++)
+                    for (c = 0; c < UA_CH; c++)
+                        blk[i * UA_CH + c] = smp(f + i, c, 0);
+                uac_tap(blk, HALF_FRAMES);
+                f += HALF_FRAMES;
+            }
+#if TEST_OUT
+            (void)uac_play_take(lr, HALF_FRAMES);
+#endif
+        }
+    }
+    cu[7] = uac.underruns - u0, co[7] = uac.overruns - o0;
+#if TEST_OUT
+    pu[7] = uo.underruns - pu_at;
+#endif
+    for (i = 0; i < 8u; i++)
+        printf("USB audio rings, %s: %u underruns, %u overruns; output %u underruns\n", PH[i], cu[i], co[i], pu[i]);
+    for (i = 0; i < 8u; i++)                            /* (only the real gap counts) */
+        assert(i == 4u ? co[i] > 0u : cu[i] == 0u && co[i] == 0u && pu[i] == 0u);
+#if TEST_OUT
+    assert(pu[4] > 0u && uo.overruns == po0);
+#endif
+    (void)t;
+    render_start_idle();
+    printf("USB audio rings lent and taken back while the computer streams, and as it stops: no under- or overrun counted: OK\n");
+}
 static void test_mem_cycles(void)
 {
     uint32_t k;
@@ -1077,6 +1165,7 @@ int main(void)
     test_mem_unlent("taken back");
 #if !TEST_HC
     test_mem_cycles();
+    test_mem_midstream();
 #endif
 #endif
     printf("USB audio: all OK\n");

@@ -264,6 +264,9 @@ static struct {
     ua_smp_t last[UA_CH];        /* the last frame sent, repeated on an underrun */
     uint32_t starts, pkts, frames;               /* frames in packets sent from the ring */
     uint32_t underruns, overruns, missed;        /* glitches: ring empty (repeat), ring full (drop), no packet ready */
+    uint32_t ovr_pend;                           /* blocks dropped, ring full: overruns once the host takes a packet again
+                                                  * (a gap in its recording); let go when it stalls or the stream changes
+                                                  * (it stopped reading: nothing of a recording lost) */
     uint32_t stalls;                             /* the host stopped reading for > 20 ms (alt still 1) */
     uint32_t adj_up, adj_down;                   /* packets one frame longer / shorter than the pattern */
     uint32_t fill_lo, fill_hi;                   /* range of fill_min since the stream started */
@@ -304,6 +307,8 @@ static struct {
     uint32_t pos;                /* the read position's fraction, Q16 */
     float err;                   /* the fill's distance from UO_TGT, smoothed (frames) */
     uint32_t pkts, frames, underruns, overruns, starts;
+    uint32_t und_pend;           /* ran dry: an underrun once the computer sends again; let go when the stream changes
+                                  * (it stopped sending: nothing of its audio lost) */
 #if FELUCCA_UAC_OUT_FEEDBACK
     int32_t fill_q8;             /* the ring's fill as each packet arrives, low-passed (Q8 frames): the feedback */
     uint32_t fbs;                /* feedback packets queued */
@@ -337,10 +342,12 @@ static uint32_t uac_mem_bytes(void) { return UAC_MEM_IN + UAC_MEM_OUT; }
 static void uac_mem(void *p)
 {
     uac.go = 0;
+    uac.ovr_pend = 0;
     RING_PUBLISH();
     ua_mem = (ua_smp_t *)p;
 #if FELUCCA_UAC_OUT
     uo.go = 0;
+    uo.und_pend = 0;
     RING_PUBLISH();
     uo_mem = p ? (uo_frm_t *)((uint8_t *)p + UAC_MEM_IN) : 0;
 #endif
@@ -1009,6 +1016,7 @@ static void uo_fb_reset(void)                           /* EP3 IN, the feedback:
 static void uo_stream(uint32_t alt)                     /* SET_INTERFACE, configuration, bus reset */
 {
     uo.go = 0;
+    uo.und_pend = 0;
     RING_PUBLISH();
     uo.alt = (uint8_t)alt;
 #if FELUCCA_UAC_OUT_FEEDBACK
@@ -1027,6 +1035,7 @@ static void uac_stream(uint32_t alt)                    /* SET_INTERFACE, config
     uac.flowing = 0;                                    /* ... once the host has taken a packet */
     uac.queued = 0;
     uac.wait = 0;
+    uac.ovr_pend = 0;
     RING_PUBLISH();
     uac.alt = (uint8_t)alt;
     uac.acc = 0;
@@ -1842,7 +1851,7 @@ static __attribute__((noinline)) void uac_tap48(const int32_t *out, uint32_t n)
     if (!UA_HAVE(ua_ring))
         return;
     if (UA_N - (w - ua_r) < n + n / 8u + 2u) {         /* nobody reads: drop the block (<= n * 160 / 147 + 1) */
-        uac.overruns++;
+        uac.ovr_pend++;                             /* (a loss only if the host reads on: uac_service) */
         return;
     }
     for (i = 0; i < n; i++) {
@@ -1946,7 +1955,7 @@ static __attribute__((noinline)) void uac_tap_hc(const int32_t *out, uint32_t n)
     if (!UA_HAVE(ua_ring))
         return;
     if (UA_N - (w - ua_r) < n + n / 128u + 2u) {       /* nobody reads: drop the block (<= n x 1.005 + 1) */
-        uac.overruns++;
+        uac.ovr_pend++;
         return;
     }
     for (i = 0; i < n; i++) {
@@ -2009,7 +2018,7 @@ static __attribute__((noinline)) void uac_tap(const int32_t *out, uint32_t n)
     return;
 #endif
     if (UA_N - (w - ua_r) < n) {                        /* nobody reads: drop the block */
-        uac.overruns++;
+        uac.ovr_pend++;
         return;
     }
 #if FELUCCA_UAC_TONE
@@ -2188,6 +2197,8 @@ static void uo_service(void)                            /* an EP4 OUT packet int
     if (uo.go)                                          /* the fill as the packets come, for the feedback */
         uo.fill_q8 += ((int32_t)((uo_w - uo_r) << 8) - uo.fill_q8) / 32;
 #endif
+    uo.underruns += uo.und_pend;                        /* (more came after it ran dry: a gap in what it plays) */
+    uo.und_pend = 0;
     uo.pkts++;
     uo.frames += n;
     csr = (csr & ~0x164u) | 0x10u;
@@ -2223,7 +2234,7 @@ static __attribute__((noinline)) int uac_play_mix(int32_t *out, uint32_t n, uint
         fill = UO_TGT;
     }
     if (fill < n) {
-        uo.underruns++;                                 /* ran dry: prime again */
+        uo.und_pend++;                                  /* ran dry: prime again (a loss if more comes: uo_service) */
         uo.go = 0;
         uo.fill_q8 = (int32_t)(UO_TGT << 8);
         uo.w0 = uo_w;
@@ -2309,7 +2320,7 @@ static __attribute__((noinline)) int uac_play_mix(int32_t *out, uint32_t n, uint
     adj = adj > 400.0f ? 400.0f : adj < -400.0f ? -400.0f : adj;
     step = (uint32_t)(65510.0f + adj);                  /* 65536 x 44100 / 44117.6 */
     if (fill < (uint32_t)(((uint64_t)n * step) >> 16) + 2u) {
-        uo.underruns++;                                 /* ran dry: prime again */
+        uo.und_pend++;                                  /* ran dry: prime again (a loss if more comes: uo_service) */
         uo.go = 0;
         RING_PUBLISH();
         uo_r = uo_w;
@@ -2377,6 +2388,7 @@ static void uac_service(void)
         if (uac.wait < 255u && ++uac.wait == 40u && uac.flowing) {
             uac.flowing = 0;
             uac.stalls++;
+            uac.ovr_pend = 0;                           /* (it stopped reading: what was dropped meanwhile lost nothing) */
         }
         return;
     }
@@ -2384,6 +2396,8 @@ static void uac_service(void)
         if (csr & 0x04u)
             uac.missed++;                               /* UnderRun: an IN token found nothing queued */
         uac.flowing = 1;
+        uac.overruns += uac.ovr_pend;                   /* (it reads on: the blocks dropped are a gap in the recording) */
+        uac.ovr_pend = 0;
     }
     uac.queued = 1;
     uac.wait = 0;
