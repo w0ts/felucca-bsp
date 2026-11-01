@@ -230,7 +230,23 @@ typedef int16_t ua_smp_t;
 #endif
 _Static_assert(UAC_MAXP <= 1023u, "a full-speed isochronous packet holds 1023 bytes: fewer channels, or 16-bit");
 _Static_assert(UA_HI + HALF_FRAMES + UA_MAXF < UA_N, "the ring holds the band, a render and a packet");
-static ua_smp_t ua_ring[UA_N * UA_CH] FELUCCA_UAC_RING_ATTR __attribute__((aligned(4)));
+/* FELUCCA_UAC_MEM 1 (fm1.toml usb_audio_mem = "app"): the input's and the output's rings are a block the app lends
+ * only while the computer streams (uac_mem, below), not static RAM: 0 until lent, and then the input sends silence
+ * packets (as before it is primed) and the output's packets are dropped (as when nobody plays them). Each user reads
+ * the pointer once (UA_RING, UO_RING): the app takes the block back with the interrupts off and frees it two of its
+ * audio blocks later, so a render still under way on the other core finishes on the block it started with */
+#ifndef FELUCCA_UAC_MEM
+#define FELUCCA_UAC_MEM 0
+#endif
+#if FELUCCA_UAC_MEM
+static ua_smp_t *volatile ua_mem;            /* the ring, lent (uac_mem); 0: none */
+#define UA_HAVE(p) ((p) != 0)
+#else
+static ua_smp_t ua_ring_s[UA_N * UA_CH] FELUCCA_UAC_RING_ATTR __attribute__((aligned(4)));
+#define ua_mem ua_ring_s
+#define UA_HAVE(p) 1
+#endif
+#define UA_RING() ua_smp_t *const ua_ring = (ua_smp_t *)ua_mem
 static volatile uint32_t ua_w, ua_r;
 static uint32_t ep4tx[(UAC_MAXP + 3u) / 4u] __attribute__((aligned(4)));
 static struct {
@@ -265,14 +281,22 @@ static struct {
 typedef struct {
     int32_t l, r;
 } uo_frm_t;
-static uo_frm_t uo_ring[UO_N];
 static uint32_t ep4rx[(UO_MAXP24 + 3u) / 4u + 1u] __attribute__((aligned(4)));
 _Static_assert(UO_TGT + HALF_FRAMES + UO_MAXF < UO_N, "the ring holds the target, a render and a packet");
 #else
 #define UO_N 2048u               /* frames; a power of two */
-static uint32_t uo_ring[UO_N];
+typedef uint32_t uo_frm_t;
 static uint32_t ep4rx[UO_MAXF + 1u] __attribute__((aligned(4)));
 #endif
+#if FELUCCA_UAC_MEM
+static uo_frm_t *volatile uo_mem;            /* the ring, lent (uac_mem, after the input's); 0: none */
+#define UO_HAVE(p) ((p) != 0)
+#else
+static uo_frm_t uo_ring_s[UO_N];
+#define uo_mem uo_ring_s
+#define UO_HAVE(p) 1
+#endif
+#define UO_RING() uo_frm_t *const uo_ring = (uo_frm_t *)uo_mem
 static volatile uint32_t uo_w, uo_r;
 static struct {
     volatile uint8_t alt;        /* the output's streaming interface: 1 = the host plays */
@@ -297,6 +321,30 @@ static struct {
 #define UO_FB_REFRESH 4
 static uint8_t uo_fb[4] __attribute__((aligned(4)));
 #endif
+#endif
+#if FELUCCA_UAC_MEM
+/* the rings' block (FELUCCA_UAC_MEM): the input's ring, then the output's; uac_mem_bytes its size (a multiple of 4).
+ * uac_mem(p), the main loop with the interrupts off: lent (p: that many bytes, 4-aligned, zeroed) or taken back (0;
+ * the app frees it only after its audio's next two blocks). Either way both streams prime again from silence */
+#define UAC_MEM_IN ((uint32_t)sizeof(ua_smp_t) * UA_N * UA_CH)
+#if FELUCCA_UAC_OUT
+#define UAC_MEM_OUT ((uint32_t)sizeof(uo_frm_t) * UO_N)
+#else
+#define UAC_MEM_OUT 0u
+#endif
+_Static_assert(UAC_MEM_IN % 8u == 0u, "the output's ring 8-aligned after the input's");
+static uint32_t uac_mem_bytes(void) { return UAC_MEM_IN + UAC_MEM_OUT; }
+static void uac_mem(void *p)
+{
+    uac.go = 0;
+    RING_PUBLISH();
+    ua_mem = (ua_smp_t *)p;
+#if FELUCCA_UAC_OUT
+    uo.go = 0;
+    RING_PUBLISH();
+    uo_mem = p ? (uo_frm_t *)((uint8_t *)p + UAC_MEM_IN) : 0;
+#endif
+}
 #endif
 #if FELUCCA_UAC_48K
 #include "uac_fir.h"
@@ -1721,8 +1769,9 @@ static void uac_hc_steer(uint32_t fill)
 
 static __attribute__((noinline)) void uac_render_start(void)   /* audio ISR, before a half buffer renders */
 {
+    UA_RING();
     uint32_t fill;
-    uac.feed = uac.alt && usb.config && uac.flowing;
+    uac.feed = uac.alt && usb.config && uac.flowing && UA_HAVE(ua_ring);   /* (no ring lent yet: not fed) */
     if (!uac.feed) {
         uac.go = 0;                                     /* not read (yet / any more): prime when it is */
         return;
@@ -1788,7 +1837,10 @@ static inline int32_t uac_in24(int32_t v) { return v > 8388607 ? 8388607 : v < -
  * phase ph (or of 159 - ph backwards: the prototype is symmetric), Q30 into 64-bit sums. */
 static __attribute__((noinline)) void uac_tap48(const int32_t *out, uint32_t n)
 {
+    UA_RING();
     uint32_t w = ua_w, i, j, k = 0, h = rs.w, ph = rs.ph;
+    if (!UA_HAVE(ua_ring))
+        return;
     if (UA_N - (w - ua_r) < n + n / 8u + 2u) {         /* nobody reads: drop the block (<= n * 160 / 147 + 1) */
         uac.overruns++;
         return;
@@ -1889,7 +1941,10 @@ static inline void uac_hc_filter(uint32_t pos, uint32_t step)
  * output frames (0, 1 or 2) whose place falls before the next: the filter at their place over the last HC_N */
 static __attribute__((noinline)) void uac_tap_hc(const int32_t *out, uint32_t n)
 {
+    UA_RING();
     uint32_t w = ua_w, i, k = 0, h = hc.w, pos = hc.pos, step = hc.step;
+    if (!UA_HAVE(ua_ring))
+        return;
     if (UA_N - (w - ua_r) < n + n / 128u + 2u) {       /* nobody reads: drop the block (<= n x 1.005 + 1) */
         uac.overruns++;
         return;
@@ -1939,8 +1994,9 @@ static __attribute__((noinline)) void uac_tap_hc(const int32_t *out, uint32_t n)
  * output, or the caller's own channels); out 0: n frames of silence */
 static __attribute__((noinline)) void uac_tap(const int32_t *out, uint32_t n)
 {
+    UA_RING();
     uint32_t w = ua_w, i;
-    if (!uac.feed)
+    if (!uac.feed || !UA_HAVE(ua_ring))
         return;
 #if FELUCCA_UAC_48K
     if (uac.ring48) {
@@ -2014,6 +2070,7 @@ static inline uint8_t *uac_put(uint8_t *p, const ua_smp_t *f, uint32_t wide)
  * frame: UA_CH samples, 2 bytes each, 3 when wide). */
 static uint32_t uac_packet(uint8_t *d, uint32_t wide)
 {
+    UA_RING();
     uint32_t n = 44u, r, fill, k, i, lo = UA_LO, hi = UA_HI;
 #if FELUCCA_UAC_48K
     if (uac.r48) {                                      /* 48 frames a ms, no pattern */
@@ -2029,7 +2086,7 @@ static uint32_t uac_packet(uint8_t *d, uint32_t wide)
             n++;
         }
     }
-    if (!uac.go || uac.ring48 != uac.r48) {             /* not primed (at this rate) yet */
+    if (!uac.go || uac.ring48 != uac.r48 || !UA_HAVE(ua_ring)) {   /* not primed (at this rate) yet; no ring */
         for (i = 0; i < n * UA_CH * (wide ? 3u : 2u); i++)
             d[i] = 0;
         return n;
@@ -2079,6 +2136,7 @@ static uint32_t uac_packet(uint8_t *d, uint32_t wide)
 #if FELUCCA_UAC_OUT
 static void uo_service(void)                            /* an EP4 OUT packet into the ring (TIMER5, nested too) */
 {
+    UO_RING();
     uint32_t csr, n, i, w, f;
     sie_wr(S_INDEX, 4);
     csr = sie_rd(S_RXCSR1) | (sie_rd(S_RXCSR2) << 8);
@@ -2100,7 +2158,9 @@ static void uo_service(void)                            /* an EP4 OUT packet int
         f = f < UO_TGT ? f : UO_TGT;
     }
 #endif
-    if (UO_N - f < n) {
+    if (!UO_HAVE(uo_ring)) {
+        /* (no ring lent yet: dropped, not counted) */
+    } else if (UO_N - f < n) {
         uo.overruns++;                                  /* nobody plays it (or the rates part): drop */
     } else {
 #if FELUCCA_UAC_OUT_24
@@ -2142,13 +2202,14 @@ static void uo_service(void)                            /* an EP4 OUT packet int
  * none). Returns 1 when the block has the computer's audio */
 static __attribute__((noinline)) int uac_play_mix(int32_t *out, uint32_t n, uint32_t gain_q12, uint32_t set)
 {
+    UO_RING();
     uint32_t r = uo_r, fill = uo_w - r, i;
 #if FELUCCA_UAC_OUT_24
     float g = (float)gain_q12 * (1.0f / 4096.0f);       /* the ring's 24 bits, x gain / 4096 */
 #else
     float g = (float)gain_q12 * (1.0f / 16.0f);         /* 16-bit to 24-bit (x 256), x gain / 4096 */
 #endif
-    if (!uo.alt || !usb.config) {
+    if (!uo.alt || !usb.config || !UO_HAVE(uo_ring)) {
         uo.go = 0;
         goto none;
     }
@@ -2223,13 +2284,14 @@ static void uo_fb_service(void)
  * block instead of added (silence while there is none). Returns 1 when the block has the computer's audio */
 static __attribute__((noinline)) int uac_play_mix(int32_t *out, uint32_t n, uint32_t gain_q12, uint32_t set)
 {
+    UO_RING();
     uint32_t r = uo_r, fill = uo_w - r, i, pos = uo.pos, step;
 #if FELUCCA_UAC_OUT_24
     float g = (float)gain_q12 * (1.0f / 4096.0f), adj;          /* the ring's 24 bits, x gain / 4096 */
 #else
     float g = (float)gain_q12 * (1.0f / 16.0f), adj;            /* 16-bit to 24-bit (x 256), x gain / 4096 */
 #endif
-    if (!uo.alt || !usb.config) {
+    if (!uo.alt || !usb.config || !UO_HAVE(uo_ring)) {
         uo.go = 0;
         goto none;
     }

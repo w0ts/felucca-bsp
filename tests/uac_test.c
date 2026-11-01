@@ -157,6 +157,10 @@ static void fm1_delay_ms(uint32_t ms) { (void)ms; }
 #define FELUCCA_UAC_OUT_FEEDBACK TEST_FB
 #define FELUCCA_UAC_OUT_24 TEST_O24
 #define FELUCCA_UAC_SPLIT TEST_SPLIT
+#ifndef TEST_MEM
+#define TEST_MEM 0                                      /* FELUCCA_UAC_MEM: the rings a block the app lends (uac_mem) */
+#endif
+#define FELUCCA_UAC_MEM TEST_MEM
 #if TEST_NAMES
 #define FELUCCA_UAC_IN_NAME "Optimist In"
 #define FELUCCA_UAC_OUT_NAME "Optimist Out"
@@ -965,8 +969,94 @@ static void test_play_clocks(void)
 }
 #endif
 
+#if TEST_MEM
+/* FELUCCA_UAC_MEM: the rings lent by the app (uac_mem). Not lent: the computer streams both ways for a second, the
+ * input sends whole silence packets and nobody captures, the output's packets are dropped (not counted as overruns)
+ * and nothing plays; nothing is written anywhere (the rings do not exist). Then lent (a heap block, every stream test
+ * after this runs on it), and at the end taken back and freed (under ASan any later touch of it fails): the streams
+ * go on silent again. Lent and taken back 20 times with a stream each time: every lend streams whole */
+static uint8_t *mem_blk;
+static void mem_lend(void)
+{
+    mem_blk = calloc(1, uac_mem_bytes());
+    assert(mem_blk && uac_mem_bytes() % 4u == 0u);
+    uac_mem(mem_blk);
+}
+static void mem_back(void)
+{
+    uac_mem(0);
+    free(mem_blk);
+    mem_blk = 0;
+}
+static void test_mem_unlent(const char *when)
+{
+    static int32_t blk[HALF_FRAMES * 8u];
+    uint32_t ms, acc = 0, pkts = 0, i, over = uac.overruns, under = uac.underruns, t = 0;
+#if TEST_OUT
+    static int32_t lr[2u * HALF_FRAMES];
+    uint32_t oover = uo.overruns, oun = uo.underruns;
+#endif
+    usb_start();
+    setup(0x00, 9, 1, 0);
+    setup(0x01, 11, 1, UAC_AS_IF);
+#if TEST_OUT
+    setup(0x01, 11, 1, UAC_ASO_IF);
+    host_play_start();
+#endif
+    for (i = 0; i < HALF_FRAMES * UA_CH; i++)
+        blk[i] = 0x123456;
+    for (ms = 0; ms < 1000u; ms++) {
+        if (regs[4][17] & 1u) {
+            for (i = 0; i < in_len; i++)
+                assert(in_pkt[i] == 0);                 /* silence */
+            regs[4][17] = 0;
+            pkts++;
+        }
+#if TEST_OUT
+        host_out(host_play_n(ms, 0), &t);
+#endif
+        usb_poll();
+        usb_poll();
+        for (acc += 441176u; acc >= HALF_FRAMES * 10000u; acc -= HALF_FRAMES * 10000u) {
+            uac_render_start();
+            assert(!uac_capturing());
+            uac_tap(blk, HALF_FRAMES);                  /* (given anyway: dropped) */
+#if TEST_OUT
+            assert(uac_play_take(lr, HALF_FRAMES) == 0);
+            for (i = 0; i < 2u * HALF_FRAMES; i++)
+                assert(lr[i] == 0);
+#endif
+        }
+    }
+    assert(pkts > 900u && uac.overruns == over && uac.underruns == under);
+#if TEST_OUT
+    assert(uo.overruns == oover && uo.underruns == oun);
+    setup(0x01, 11, 0, UAC_ASO_IF);
+#endif
+    (void)t;
+    setup(0x01, 11, 0, UAC_AS_IF);
+    render_start_idle();
+    printf("USB audio rings not lent (%s): %u silence packets, nothing captured or played, nothing counted: OK\n", when,
+           pkts);
+}
+static void test_mem_cycles(void)
+{
+    uint32_t k;
+    for (k = 0; k < 20u; k++) {
+        mem_lend();
+        test_stream(1, 0);
+        mem_back();
+    }
+    printf("USB audio rings lent and taken back 20 times, a whole stream each: OK\n");
+}
+#endif
+
 int main(void)
 {
+#if TEST_MEM
+    test_mem_unlent("before the first lend");
+    mem_lend();
+#endif
     test_descriptors();
 #if TEST_HC
     test_stream(1, 1);                                  /* silence (resampled) is silence */
@@ -981,6 +1071,13 @@ int main(void)
 #if TEST_OUT
     test_play_take();
     test_play_clocks();
+#endif
+#if TEST_MEM
+    mem_back();
+    test_mem_unlent("taken back");
+#if !TEST_HC
+    test_mem_cycles();
+#endif
 #endif
     printf("USB audio: all OK\n");
     return 0;
