@@ -35,7 +35,8 @@
  * Hooks from the platform (loader.c, ldr_test.c):
  *   ldr_fread(off, p, n)  ldr_erase(off)  ldr_prog(off, p, n)   flash, 0 = ok
  *   ldr_record_clear()    forget the RAM update record
- *   ldr_progress(done, total)  both passes on one scale: the check (2b, flash.bin) then the write (3, the app area)
+ *   ldr_progress(done, total)  both passes on one scale: the check (2b, flash.bin) then the write (3, the app area);
+ *                              the fast install: the table's bytes, then each app sector compared or written
  *   with LDR_FAST_CHUNK (the fast install, ldr_fast below): ldr_erase_begin(off) ldr_erase_end(), an erase while a
  *   sector comes in (no flash access between)
  * plus the ota.c hooks (frames, time, idle). */
@@ -289,8 +290,13 @@ static int ldr_classic(void)
  *   3'.  a sector whose flash already has both CRCs is kept and never sent; any other one is erased while it comes in
  *        (one 4 KiB read), checked against both CRCs (three tries: never written otherwise), programmed and verified
  *        byte for byte. A cut-off install resumes the same way: what was written already is skipped.
+ *        The host learns how far the comparison is (cmd 0x32, ldr_check_note): its bar moves over the sectors kept,
+ *        which it is never asked for (a resumed install: most of them).
  * A flash.bin that is not whole sectors goes the classic way. */
 #define LDR_FAST_CMD 0x31u
+#define LDR_CHECK_CMD 0x32u                     /* [sectors compared, all sectors: 16-bit LE each], to the host */
+#define LDR_CHECK_EVERY 8u                      /* at most a 0x32 frame every 8 sectors ... */
+#define LDR_CHECK_MS 100u                       /* ... or 100 ms, and the last */
 #define LDR_TBL 0xD0000000u
 #define LDR_NMAX (LDR_FL_MAX >> 12)
 _Static_assert(LDR_FAST_CHUNK == 0x1000u && LDR_NMAX * 6u <= LDR_FAST_CHUNK, "one read per sector, the table in one");
@@ -318,18 +324,21 @@ static uint32_t ldr_crc32(const uint8_t *p, uint32_t n)   /* zlib's */
     return ~c;
 }
 
-static int ldr_table_ok(const uint8_t *t, uint32_t n, uint32_t want, uint8_t *zero)
+/* the CRC16 (ota_crc16's) of 4 KiB of zeros from c. CCITT's polynomial is (x + 1) times a primitive one of degree 15, so
+ * x^32767 = 1 and 32768 zero bits move the register as one bit does: one step, not 32768 (ota_crc16 over 4096 zero
+ * bytes ran ~46 instructions a byte: ~48 M for a 1 MiB flash.bin before the bar moved; tests/ldr_table_test.c: the same
+ * as ota_crc16) */
+static uint32_t ldr_zeros4k(uint32_t c)
 {
-    uint32_t k, i, c = 0;
-    for (k = 0; k < 0x200u; k++)
-        zero[k] = 0;
-    for (k = 0; k < n; k++) {                            /* crc(A || B) = crc(A shifted over |B| zeros) ^ crc(B) */
-        for (i = 0; i < 0x1000u; i += 0x200u)
-            c = ota_crc16(zero, 0x200u, c);
-        c ^= ota_rd16(t + k * 6u);
-        if (!(k & 31u))
-            ota_idle();
-    }
+    return (c & 0x8000u ? (c << 1) ^ 0x1021u : c << 1) & 0xFFFFu;
+}
+
+/* the table's CRC16s combined: the UFW entry's CRC16 of the whole flash.bin (n steps of 16 bits: no time to show) */
+static int ldr_table_ok(const uint8_t *t, uint32_t n, uint32_t want)
+{
+    uint32_t k, c = 0;
+    for (k = 0; k < n; k++)                              /* crc(A || B) = crc(A shifted over |B| zeros) ^ crc(B) */
+        c = ldr_zeros4k(c) ^ ota_rd16(t + k * 6u);
     return c == want;
 }
 
@@ -351,26 +360,41 @@ static int ldr_fetch(uint32_t src, uint8_t *b, const uint8_t *t)
     return -13;                                          /* it came in different three times: not written */
 }
 
+/* cmd 0x32 [k sectors of the app area compared, of n: 16-bit LE each]: queued, sent by the USB polls (ldr_progress) */
+static void ldr_check_note(uint32_t k, uint32_t n)
+{
+    uint8_t b[4];
+    b[0] = (uint8_t)k;
+    b[1] = (uint8_t)(k >> 8);
+    b[2] = (uint8_t)n;
+    b[3] = (uint8_t)(n >> 8);
+    ota_send_msg(LDR_CHECK_CMD, b, 4);
+}
+
 static int ldr_fast(void)
 {
     static uint8_t tbl[LDR_NMAX * 6u];
     uint8_t *const hdr = ldr_hdr, *const sec = ldr_sec, *const cur = ldr_cur;
-    uint32_t fl_off, fl_size, key, s, want, n, done = 0;
+    uint32_t fl_off, fl_size, key, s, want, n, total, done = 0, k, note_k = 0, note_ms;
     int rc;
     if ((rc = ldr_head(hdr, sec, &fl_off, &fl_size, &want, &key)) != 0)
         return rc;
     if (fl_size & 0xFFFu)
         return ldr_classic();
     n = fl_size >> 12;
+    total = n * 6u + (LDR_APP_HI - LDR_APP_LO);           /* the bar: the table read, then every app sector compared
+                                                          * (kept or written), from 0: not flash.bin's half of the
+                                                          * classic scale, whose check pass takes no time here */
     if (ota_read(LDR_TBL + fl_off, tbl, n * 6u))
         return -7;
-    if (!ldr_table_ok(tbl, n, want, sec))
+    if (!ldr_table_ok(tbl, n, want))
         return -12;                                      /* nothing erased */
-    ldr_progress(fl_size, fl_size + (LDR_APP_HI - LDR_APP_LO));
+    ldr_progress(n * 6u, total);                         /* (the table's bytes: the bar's scale is what takes time) */
 #if defined(LDR_SLOT_SWITCH) && LDR_SLOT_SWITCH
     if ((rc = ldr_slot_switch(key, sec)) != 0)
         return rc;
 #endif
+    note_ms = ota_now_ms();
     for (s = LDR_APP_LO; s < LDR_APP_HI; s += 0x1000u) {
         const uint8_t *t = tbl + (s >> 12) * 6u;
         if (ldr_fread(s, cur, 0x1000u))
@@ -387,7 +411,13 @@ static int ldr_fast(void)
                 return rc;
         }
         done += 0x1000u;
-        ldr_progress(fl_size + done, fl_size + (LDR_APP_HI - LDR_APP_LO));
+        k = done >> 12;
+        if (k == LDR_NSEC || k - note_k >= LDR_CHECK_EVERY || ota_now_ms() - note_ms >= LDR_CHECK_MS) {
+            note_k = k;
+            note_ms = ota_now_ms();
+            ldr_check_note(k, LDR_NSEC);
+        }
+        ldr_progress(n * 6u + done, total);
     }
     return ldr_finish(sec);
 }
