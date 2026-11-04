@@ -12,6 +12,7 @@
  *   fm1_lcd_cs_pulse()          CS high for a moment, then low (before each LCD command: the panel counts its bits
  *                               from a CS edge; no clock meanwhile, so the card, selected for that moment, sees none)
  *   fm1_sd_hw_take(baud, mode)  the bus to the card: PC8 readable and pulled up (no card: 0xFF, as an idle card),
+ *                               SCK (PC9) on its stronger drive until fm1_sd_hw_give,
  *                               PC10 pulled up, SPI1's clock lsb / (baud + 1); returns SPI1's CON to give back
  *   fm1_sd_hw_give(con, mode)   the card deselected, the LCD selected and idle, PC8 driven, SPI1's CON as it was; the
  *                               caller sets the LCD's clock again (fm1_lcd_baud)
@@ -73,6 +74,8 @@ static uint32_t fm1_sd_hw_take(uint32_t baud, uint32_t mode)
     uint32_t con = FM1_LCD_SPI_CON & ~0xC000u;
     FM1_PR(FM1_PC, FM1_DIE) |= FM1_LCD_DC;
     FM1_PR(FM1_PC, FM1_PU) |= FM1_LCD_DC | FM1_LCD_DO;
+    FM1_PR(FM1_PC, FM1_HD) |= FM1_LCD_CLK;           /* SCK driven hard for the card alone: the data's delay is why the reads stop
+                                                      * (docs/SD.md), the LCD keeps its drive */
     if (mode == FM1_SD_HW_GPIO) {
         FM1_LCD_IOMAP_CON1 &= ~0x10u;                /* SPI1 off PC9 / PC10 */
         FM1_LCD_PC_OUT &= ~FM1_LCD_CLK;
@@ -85,6 +88,7 @@ static void fm1_sd_hw_give(uint32_t con, uint32_t mode)
 {
     fm1_sd_hw_desel();
     FM1_PR(FM1_PC, FM1_PU) &= ~(FM1_LCD_DC | FM1_LCD_DO);
+    FM1_PR(FM1_PC, FM1_HD) &= ~FM1_LCD_CLK;
     if (mode == FM1_SD_HW_GPIO)
         FM1_LCD_IOMAP_CON1 |= 0x10u;
     FM1_LCD_SPI_CON = con | 0x4000u;

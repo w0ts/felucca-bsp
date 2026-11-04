@@ -47,6 +47,14 @@ Three ways to read a byte, because which one SPI1 does on PC8 is not yet seen on
 byte shifted in while one is sent, read back from BUF) and `FM1_SD_HW_GPIO` (the three lines as plain pins, SPI1 off
 them for the session; no DMA). A driver tries them in turn until the card answers CMD0.
 
+## Why SCK has the stronger drive
+
+Reads stop at a clock the card should pass, as a timeout and not a CRC failure: the card's data comes back later than
+SPI1 samples it, by a fixed delay near half a period at 8.57 MHz (both FM-1s stop there; raw reads on one, 2026-11-04: above it
+each byte reads one bit late, `FE` as `FF`, which R1 and the token read as a refusal). SPI1 has no sampling delay
+(the WL82 SDK's driver sets only CON b4 to b6), and sampling on the falling edge loses a bit on this chip. HD on
+SCK, for the card's session alone, took the clock from 8.57 to 10 MHz on that FM-1; the LCD keeps its usual drive.
+
 ## Not verified on an FM-1
 
 No FM-1 has the mod yet. Unverified: the read modes above, SPI1's DMA receiving as master (a driver should check it
