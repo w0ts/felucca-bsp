@@ -18,6 +18,7 @@ for mode in host host-audio host-name device loader \
     case "$mode" in
         host) flags="" ;;
         host-audio) flags="-DTEST_UAC=1" ;;
+        host-name) flags="-DFELUCCA_USB_HOST_NAME=1" ;;
         device) flags="-DTEST_HOST=0" ;;
         loader) flags="-DFELUCCA_LOADER=1" ;;
         host-name) flags="-DFELUCCA_USB_HOST_NAME=1" ;;

@@ -77,6 +77,8 @@ extern uint32_t fm1_cpu1_ustack[], fm1_cpu1_sstack_top[];
                                                          * set more for deeper jobs, a multiple of 8, the lowest 256 B a guard */
 #endif
 #define FM1_CPU1_USTACK_WORDS (FM1_CPU1_USTACK_BYTES / 4u)   /* (fm1_cpu1.S) */
+_Static_assert(FM1_CPU1_USTACK_BYTES % 8 == 0 && FM1_CPU1_USTACK_BYTES > 256,
+               "FM1_CPU1_USTACK_BYTES: a multiple of 8, above the 256 B guard");
 #define FM1_CPU1_MARK 0x43314D4Bu                       /* "C1MK": how deep its stack has gone */
 
 typedef void (*fm1_cpu1_fn)(uint32_t);

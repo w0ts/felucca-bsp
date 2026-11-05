@@ -220,6 +220,7 @@ static void deliver_rx(void)            /* an IN request is pending on EP1 and t
     d = by_addr(common[0]);
     if (!d || d != &dev[KBD] || rx_head == rx_tail)
         return;
+    assert(ep_radr[1]);                                 /* the host code gave EP1 its buffer */
     memcpy(ep_radr[1], rx_q[rx_tail % 8], rx_n[rx_tail % 8]);
     regs[1][22] = rx_n[rx_tail % 8];
     regs[1][23] = 0;
@@ -236,7 +237,7 @@ static void mock_write(uint32_t r, uint32_t v)
         common[r] = (uint8_t)v;
     } else if (r < 16) {
         common[r] = (uint8_t)v;
-    } else if (index_reg == 0 && r == 17) {             /* EP0 CSR, host */
+    } else if (index_reg == 0 && r == 17 && ep_radr[0]) { /* EP0 CSR, host (the host code gave EP0 its buffer) */
         dev_t_ *d = by_addr(common[0]);
         if (v == 0x0A) {
             setup_requests++;
@@ -360,6 +361,9 @@ static void fm1_delay_ms(uint32_t ms) { (void)ms; }
 #define HALF_FRAMES 128u
 static volatile uint32_t render_peak;
 static volatile uint8_t render_busy;
+static uint8_t sx_seen[8];                              /* FELUCCA_SYSEX_BYTE: the bytes the hook saw */
+static uint32_t sx_seen_n;
+#define FELUCCA_SYSEX_BYTE(b) (sx_seen_n < sizeof sx_seen ? (void)(sx_seen[sx_seen_n++] = (b)) : (void)0)
 #include "../chip/usb.c"
 
 /* ------------------------------------------- the device's descriptors --- */
@@ -1173,10 +1177,17 @@ int main(void)
         assert(usb.uboot_req);
         usb.uboot_req = 0;
     }
+    {   /* FELUCCA_SYSEX_BYTE sees every byte of a SysEx, F0 and F7 too, in the order they came */
+        static const uint8_t SX[5] = {0xF0, 0x7D, 0x01, 0x02, 0xF7};
+        sx_seen_n = 0;
+        midi_in_event(0x04u | 0xF0u << 8 | 0x7Du << 16 | 0x01u << 24);
+        midi_in_event(0x06u | 0x02u << 8 | 0xF7u << 16);
+        assert(sx_seen_n == 5u && memcmp(sx_seen, SX, 5u) == 0);
+    }
     usb_detach();
     usb_retry(5000u);
     assert(!usb.up);
-    puts("USB device-only/loader: startup, MIDI output and detach: OK");
+    puts("USB device-only/loader: startup, MIDI output, the SysEx byte hook and detach: OK");
     return 0;
 }
 #endif

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MPL-2.0
- * Copyright (C) 2026 hdavid */
+ * Copyright (C) 2026 Henri David */
 /* chip/fm1_cache_ram.h on a model of the corex2 cache registers, the tag RAM and the data ways: 2, 4 and 7 ways
  * (the masks written, the tags invalid, CACHE_CON's bits 8-9 off while they change and back after, the memory zeroed,
  * its bytes); 0 and 8 ways (nothing touched); and the failures, each put back as the boot loader left it with 0 bytes:

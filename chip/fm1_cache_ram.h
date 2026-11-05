@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MPL-2.0
- * Copyright (C) 2026 hdavid: from Optimist (github.com/w0ts/optimist, firmware/hal/fm1_cache.h, 9a1360ab), offered
+ * Copyright (C) 2026 Henri David: from Optimist (github.com/w0ts/optimist, firmware/hal/fm1_cache.h, 9a1360ab), offered
  *   there under GPL-3.0-only OR MPL-2.0 (Optimist 3815869f, LICENSING.md "The cache RAM"); taken here
  *   under MPL-2.0
  * Written against the public JieLi AC79 SDK (Apache-2.0); see NOTICE. */

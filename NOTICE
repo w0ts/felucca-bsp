@@ -33,10 +33,10 @@ The sliced sector erase (chip/fm1_flash_slice.h, tests/flash_slice_test.c, fl_er
 chip/fm1_flash.h): Copyright (C) 2026 hdavid, from Optimist (https://github.com/w0ts/optimist, 54d89896), offered
 there under GPL-3.0-only OR MPL-2.0 (Optimist 25b17fc7) and taken here under MPL-2.0.
 
-The cache RAM (chip/fm1_cache_ram.h): Copyright (C) 2026 hdavid, from Optimist (https://github.com/w0ts/optimist,
+The cache RAM (chip/fm1_cache_ram.h): Copyright (C) 2026 Henri David, from Optimist (https://github.com/w0ts/optimist,
 firmware/hal/fm1_cache.h, f16f6683 and 9a1360ab), offered there under GPL-3.0-only OR MPL-2.0 (Optimist LICENSING.md
 "The cache RAM", 3815869f) and taken here under MPL-2.0; its register addresses and sequence are the AC79 SDK's
-(Apache-2.0). tests/cache_ram_test.c: Copyright (C) 2026 hdavid, MPL-2.0.
+(Apache-2.0). tests/cache_ram_test.c: Copyright (C) 2026 Henri David, MPL-2.0.
 
 Unofficial. Not affiliated with or endorsed by M-VAVE or JieLi.
 
