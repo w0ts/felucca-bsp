@@ -1031,6 +1031,9 @@ static const uint8_t STR2[] = {16, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c
 #endif
 
 #if defined(FELUCCA_USB_MANUFACTURER) || defined(FELUCCA_USB_PRODUCT) || defined(FELUCCA_USB_NAME_FN) || FELUCCA_UAC_SPLIT
+#ifdef FELUCCA_USB_NAME_FN
+extern const char *FELUCCA_USB_NAME_FN(void);
+#endif
 /* A string descriptor built from a plain ASCII string (the build settings FELUCCA_USB_MANUFACTURER and
  * FELUCCA_USB_PRODUCT, e.g. -DFELUCCA_USB_PRODUCT='"CTL-1 FM-1"'), at most 31 characters, and a suffix after it
  * (usb_str_desc2: " In" after a name asked at run time). EP0 sends one descriptor at a time, so one buffer serves all. */
@@ -1056,6 +1059,19 @@ static int usb_str_desc2(const char *s, const char *tail, const uint8_t **d, uin
 }
 
 #define usb_str_desc(s, d, l) usb_str_desc2((s), "", (d), (l))
+#ifdef FELUCCA_USB_NAME_FN
+static const char *usb_product_name(void)    /* the function's name, else FELUCCA_USB_PRODUCT, else the default */
+{
+    const char *n = FELUCCA_USB_NAME_FN();
+    if (n && n[0])
+        return n;
+#ifdef FELUCCA_USB_PRODUCT
+    return FELUCCA_USB_PRODUCT;
+#else
+    return "Felucca";
+#endif
+}
+#endif
 #endif
 
 #if FELUCCA_UAC_SPLIT && defined FELUCCA_UAC_CH_NAMES
@@ -1107,7 +1123,9 @@ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
             return 1;
 #endif
         case 2:
-#if   defined(FELUCCA_USB_PRODUCT)
+#ifdef FELUCCA_USB_NAME_FN
+            return usb_str_desc(usb_product_name(), d, l);
+#elif defined(FELUCCA_USB_PRODUCT)
             return usb_str_desc(FELUCCA_USB_PRODUCT, d, l);
 #else
             *d = STR2;
