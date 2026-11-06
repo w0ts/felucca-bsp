@@ -94,8 +94,11 @@
 #ifndef FELUCCA_UAC_CH
 #define FELUCCA_UAC_CH 2
 #endif
-/* 0=1: the caller fills every channel (uac_tap's frames: its own routing); 0: the master on 1 and 2,
+/* FELUCCA_UAC_CAPTURE=1: the caller fills every channel (uac_tap's frames: its own routing); 0: the master on 1 and 2,
  * the caller's on 3..N by uac_ch_frame */
+#ifndef FELUCCA_UAC_CAPTURE
+#define FELUCCA_UAC_CAPTURE 0
+#endif
 #ifndef FELUCCA_UAC_24
 #define FELUCCA_UAC_24 0
 #endif
@@ -133,7 +136,10 @@
 #undef FELUCCA_UAC_24
 #define FELUCCA_UAC_24 0
 #endif
-#if FELUCCA_UAC_48K && ((0 && FELUCCA_UAC_CH != 2) || FELUCCA_UAC_24)
+#if FELUCCA_UAC_CAPTURE && FELUCCA_UAC_CH > 8
+#error "FELUCCA_UAC_CAPTURE: FELUCCA_UAC_CH is 2, 4 or 8"
+#endif
+#if FELUCCA_UAC_48K && ((FELUCCA_UAC_CAPTURE && FELUCCA_UAC_CH != 2) || FELUCCA_UAC_24)
 #error "FELUCCA_UAC_48K resamples stereo 16-bit only: set it to 0 with FELUCCA_UAC_CH != 2 or FELUCCA_UAC_24"
 #endif
 #if FELUCCA_UAC_HOST_CLOCK && FELUCCA_UAC_48K
@@ -157,7 +163,7 @@
 #if FELUCCA_UAC_CH < 2 || FELUCCA_UAC_CH > 10 || (FELUCCA_UAC_CH & 1)
 #error "FELUCCA_UAC_CH is 2, 4, 6, 8 or 10"
 #endif
-#if FELUCCA_UAC_CH > 2 && !0
+#if FELUCCA_UAC_CH > 2 && !FELUCCA_UAC_CAPTURE
 #define UA_MC 1
 #undef FELUCCA_UAC_48K
 #define FELUCCA_UAC_48K 0
@@ -165,7 +171,7 @@
 #define UA_MC 0
 #endif
 #if UA_MC && (FELUCCA_UAC_24 || FELUCCA_UAC_HOST_CLOCK)
-#error "FELUCCA_UAC_24 and FELUCCA_UAC_HOST_CLOCK with more than 2 channels: 0 1"
+#error "FELUCCA_UAC_24 and FELUCCA_UAC_HOST_CLOCK with more than 2 channels: FELUCCA_UAC_CAPTURE 1"
 #endif
 enum { S_FADDR = 0, S_POWER = 1, S_INTRTX1 = 2, S_INTRTX2 = 3, S_INTRRX1 = 4, S_INTRRX2 = 5, S_INTRUSB = 6,
        S_INTRTX1E = 7, S_INTRTX2E = 8, S_INTRRX1E = 9, S_INTRRX2E = 10, S_INTRUSBE = 11, S_FRAME1 = 12,
@@ -668,7 +674,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #endif
 #define D_AC_HEADER(a, terminals) 8 + AC_NCOLL, 0x24, 1, 0x00, 0x01, 8 + AC_NCOLL + (terminals), 0, AC_NCOLL, AC_COLL(a),
 /* the input terminal's channels: 2 are L R (0x0003); any other count non-spatial (0: the host numbers them) */
-#define UA_CHCFG 0x0003u
+#define UA_CHCFG (FELUCCA_UAC_CAPTURE && FELUCCA_UAC_CH != 2 ? 0u : 0x0003u)
 /* EP4 IN: isochronous asynchronous (the I2S's clock), or with FELUCCA_UAC_HOST_CLOCK synchronous (the host's) */
 #if FELUCCA_UAC_HOST_CLOCK
 #define UA_EP_ATTR 0x0D
@@ -760,8 +766,8 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #define CDC_LEN 66                                         /* with its IAD */
 #define BCD_LO(cdc) (0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K) + 0x20 * UA_MC + 0x40 * FELUCCA_UAC_OUT + 0x08 * (FELUCCA_UAC_AS_FIRST || 0) + \
                      0x80 * (FELUCCA_UAC_MIDI_LAST == 1) + ((cdc) ? 0x01 + 2 * FELUCCA_USB_LAYOUT : 0))
-#define BCD_HI (0x03 + (FELUCCA_UAC_MIDI_LAST == 2) + 2 * FELUCCA_UAC_IAD + \
-                0x20 * (0 && FELUCCA_UAC_CH == 8) + 0x40 * FELUCCA_UAC_HOST_CLOCK + 0x80 * FELUCCA_UAC_24)
+#define BCD_HI (0x03 + (FELUCCA_UAC_MIDI_LAST == 2) + 2 * FELUCCA_UAC_IAD + 0x10 * FELUCCA_UAC_CAPTURE + \
+                0x20 * (FELUCCA_UAC_CAPTURE && FELUCCA_UAC_CH == 8) + 0x40 * FELUCCA_UAC_HOST_CLOCK + 0x80 * FELUCCA_UAC_24)
 #define D_DEV(bcdusb, cls, sub, proto, cdc)                                                          \
     18, 1, (bcdusb) & 0xFF, (bcdusb) >> 8, (cls), (sub), (proto), 64, 0x09, 0x12, FELUCCA_USB_PID & 0xFF, \
     FELUCCA_USB_PID >> 8, BCD_LO(cdc), BCD_HI, 1, 2, 0, 1

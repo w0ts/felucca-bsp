@@ -64,10 +64,15 @@ done
 # and the output as two functions (FELUCCA_UAC_SPLIT, TEST_SPLIT), named or not, alone, and with all of the above
 for flags in "" \
              "-DTEST_OUT=0" \
+             "-DTEST_CH=4 -DTEST_24=1" \
+             "-DTEST_CH=4 -DTEST_24=1 -DTEST_CDC=1" \
              "-DTEST_CH=4 -DTEST_TAP=1 -DTEST_OUT=0" \
              "-DTEST_CH=8 -DTEST_TAP=1 -DTEST_OUT=0" \
              "-DTEST_CH=2 -DTEST_24=1" \
-             "-DTEST_HC=1"; do
+             "-DTEST_CH=8" \
+             "-DTEST_HC=1" \
+             "-DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1" \
+             "-DTEST_HC=1 -DTEST_CH=8 -DTEST_OUT=0"; do
     # Word splitting is intentional for the fixed compiler options above.
     "${CC:-cc}" -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function \
         -Wno-unused-variable -Wno-missing-field-initializers \
