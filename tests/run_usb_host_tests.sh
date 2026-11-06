@@ -72,7 +72,13 @@ for flags in "" \
              "-DTEST_CH=8" \
              "-DTEST_HC=1" \
              "-DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1" \
-             "-DTEST_HC=1 -DTEST_CH=8 -DTEST_OUT=0"; do
+             "-DTEST_HC=1 -DTEST_CH=8 -DTEST_OUT=0" \
+             "-DTEST_FB=1" \
+             "-DTEST_FB=1 -DTEST_CH=4 -DTEST_24=1" \
+             "-DTEST_FB=1 -DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1" \
+             "-DTEST_O24=1" \
+             "-DTEST_FB=1 -DTEST_O24=1" \
+             "-DTEST_FB=1 -DTEST_O24=1 -DTEST_HC=1 -DTEST_CH=4 -DTEST_24=1"; do
     # Word splitting is intentional for the fixed compiler options above.
     "${CC:-cc}" -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-function \
         -Wno-unused-variable -Wno-missing-field-initializers \
