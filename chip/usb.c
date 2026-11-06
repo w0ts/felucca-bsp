@@ -344,14 +344,22 @@ typedef int16_t ua_smp_t;
 #endif
 _Static_assert(UAC_MAXP <= 1023u, "a full-speed isochronous packet holds 1023 bytes: fewer channels, or 16-bit");
 _Static_assert(UA_HI + HALF_FRAMES + UA_MAXF < UA_N, "the ring holds the band, a render and a packet");
-/* 0 1 (fm1.toml usb_audio_mem = "app"): the input's and the output's rings are a block the app lends
+/* FELUCCA_UAC_MEM 1 (fm1.toml usb_audio_mem = "app"): the input's and the output's rings are a block the app lends
  * only while the computer streams (uac_mem, below), not static RAM: 0 until lent, and then the input sends silence
  * packets (as before it is primed) and the output's packets are dropped (as when nobody plays them). Each user reads
  * the pointer once (UA_RING, UO_RING): the app takes the block back with the interrupts off and frees it two of its
  * audio blocks later, so a render still under way on the other core finishes on the block it started with */
+#ifndef FELUCCA_UAC_MEM
+#define FELUCCA_UAC_MEM 0
+#endif
+#if FELUCCA_UAC_MEM
+static ua_smp_t *volatile ua_mem;            /* the ring, lent (uac_mem); 0: none */
+#define UA_HAVE(p) ((p) != 0)
+#else
 static ua_smp_t ua_ring_s[UA_N * UA_CH] FELUCCA_UAC_RING_ATTR __attribute__((aligned(4)));
 #define ua_mem ua_ring_s
 #define UA_HAVE(p) 1
+#endif
 #define UA_RING() ua_smp_t *const ua_ring = (ua_smp_t *)ua_mem
 static volatile uint32_t ua_w, ua_r;
 static uint32_t ep4tx[(UAC_MAXP + 3u) / 4u] __attribute__((aligned(4)));
@@ -398,9 +406,14 @@ _Static_assert(UO_TGT + HALF_FRAMES + UO_MAXF < UO_N, "the ring holds the target
 typedef uint32_t uo_frm_t;
 static uint32_t ep4rx[UO_MAXF + 1u] __attribute__((aligned(4)));
 #endif
+#if FELUCCA_UAC_MEM
+static uo_frm_t *volatile uo_mem;            /* the ring, lent (uac_mem, after the input's); 0: none */
+#define UO_HAVE(p) ((p) != 0)
+#else
 static uo_frm_t uo_ring_s[UO_N];
 #define uo_mem uo_ring_s
 #define UO_HAVE(p) 1
+#endif
 #define UO_RING() uo_frm_t *const uo_ring = (uo_frm_t *)uo_mem
 static volatile uint32_t uo_w, uo_r;
 static struct {
@@ -428,6 +441,32 @@ static struct {
 #define UO_FB_REFRESH 4
 static uint8_t uo_fb[4] __attribute__((aligned(4)));
 #endif
+#endif
+#if FELUCCA_UAC_MEM
+/* the rings' block (FELUCCA_UAC_MEM): the input's ring, then the output's; uac_mem_bytes its size (a multiple of 4).
+ * uac_mem(p), the main loop with the interrupts off: lent (p: that many bytes, 4-aligned, zeroed) or taken back (0;
+ * the app frees it only after its audio's next two blocks). Either way both streams prime again from silence */
+#define UAC_MEM_IN ((uint32_t)sizeof(ua_smp_t) * UA_N * UA_CH)
+#if FELUCCA_UAC_OUT
+#define UAC_MEM_OUT ((uint32_t)sizeof(uo_frm_t) * UO_N)
+#else
+#define UAC_MEM_OUT 0u
+#endif
+_Static_assert(UAC_MEM_IN % 8u == 0u, "the output's ring 8-aligned after the input's");
+static uint32_t uac_mem_bytes(void) { return UAC_MEM_IN + UAC_MEM_OUT; }
+static void uac_mem(void *p)
+{
+    uac.go = 0;
+    uac.ovr_pend = 0;
+    RING_PUBLISH();
+    ua_mem = (ua_smp_t *)p;
+#if FELUCCA_UAC_OUT
+    uo.go = 0;
+    uo.und_pend = 0;
+    RING_PUBLISH();
+    uo_mem = p ? (uo_frm_t *)((uint8_t *)p + UAC_MEM_IN) : 0;
+#endif
+}
 #endif
 #if FELUCCA_UAC_48K
 #include "uac_fir.h"
