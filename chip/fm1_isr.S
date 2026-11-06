@@ -18,3 +18,5 @@
 
 	FM1_ISR isr_timer5, fm1_timer5_irq
 	FM1_ISR isr_alnk0, fm1_alnk0_irq
+	.weak fm1_spi1_irq
+	FM1_ISR isr_spi1, fm1_spi1_irq      /* SPI1 (the SD card's read run in its interrupt, device/sd_irq.h); weak: a firmware without it links */
