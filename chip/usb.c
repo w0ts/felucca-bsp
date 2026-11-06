@@ -35,7 +35,7 @@
  * FELUCCA_UAC_OUT_24=1 (with FELUCCA_UAC_OUT) adds alt setting 2 of the output stream, 24-bit (3-byte subframes; alt 1
  * stays 16-bit, the host picks): the ring keeps 24 bits (and alt 1's 16 as 24), so the computer's audio reaches the
  * render whole. Off (the default), nothing changes.
- * 0=1 (with FELUCCA_UAC, without FELUCCA_CDC) presents the audio input and the audio output as two audio
+ * FELUCCA_UAC_SPLIT=1 (with FELUCCA_UAC, without FELUCCA_CDC) presents the audio input and the audio output as two audio
  * functions of their own beside MIDI's (three IADs: MIDI IF 0-1, the input IF 2-3, the output IF 4-5), each named
  * (FELUCCA_UAC_IN_NAME, FELUCCA_UAC_OUT_NAME: the product's name + " In" / " Out" by default), its channels named
  * too (FELUCCA_UAC_CH_NAMES, a list of strings, one a channel). A computer lists them as two devices, each on its
@@ -111,6 +111,9 @@
 #ifndef FELUCCA_UAC_OUT_24
 #define FELUCCA_UAC_OUT_24 0
 #endif
+#ifndef FELUCCA_UAC_SPLIT
+#define FELUCCA_UAC_SPLIT 0
+#endif
 #ifndef FELUCCA_UAC_MIDI_LAST
 #define FELUCCA_UAC_MIDI_LAST 0
 #endif
@@ -121,6 +124,8 @@
 #error "FELUCCA_UAC_MIDI_LAST is 0..2"
 #endif
 #if !FELUCCA_UAC
+#undef FELUCCA_UAC_SPLIT
+#define FELUCCA_UAC_SPLIT 0
 #endif
 #if !FELUCCA_UAC || !FELUCCA_UAC_OUT
 #undef FELUCCA_UAC_OUT_FEEDBACK
@@ -157,6 +162,12 @@
 #endif
 #if FELUCCA_UAC_OUT_FEEDBACK && FELUCCA_CDC
 #error "FELUCCA_UAC_OUT_FEEDBACK sends its feedback on EP3 IN, the console's: set FELUCCA_CDC to 0 with it"
+#endif
+#if FELUCCA_UAC_SPLIT && FELUCCA_CDC
+#error "FELUCCA_UAC_SPLIT presents the audio functions without the console: set FELUCCA_CDC to 0 with it"
+#endif
+#if FELUCCA_UAC_SPLIT && (FELUCCA_UAC_MIDI_LAST || FELUCCA_UAC_IAD)
+#error "FELUCCA_UAC_SPLIT has its own interface order and IADs: set FELUCCA_UAC_MIDI_LAST and FELUCCA_UAC_IAD to 0 with it"
 #endif
 #if FELUCCA_UAC_MIDI_LAST                 /* the collection follows the interfaces: the streams come first anyway */
 #undef FELUCCA_UAC_AS_FIRST
@@ -623,7 +634,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
  * (+0.02 per FELUCCA_USB_LAYOUT step, so a host never reuses what it learnt about another layout);
  * +1.00 with 24-bit (FELUCCA_UAC_24), +10.00 x the channels when they are not 2 (FELUCCA_UAC_CH: 4 ch 16-bit 43.xx),
  * +2.00 on the computer's clock (FELUCCA_UAC_HOST_CLOCK: a synchronous endpoint), +8.00 with the output in 24-bit too
- * (FELUCCA_UAC_OUT_24), +0.08 the two audio functions apart (0: misc / IAD, bcdUSB 2.00; in felucca-bsp's
+ * (FELUCCA_UAC_OUT_24), +0.08 the two audio functions apart (FELUCCA_UAC_SPLIT: misc / IAD, bcdUSB 2.00; in felucca-bsp's
  * main FELUCCA_UAC_AS_FIRST's +0.08 too: both take the audio streaming interfaces out of MIDI's way, the split for good).
  * FELUCCA_UAC_MIDI_LAST (felucca-bsp main): +0.20 x its value (the high byte), +0.60 the IAD without the console
  * (FELUCCA_UAC_IAD), also in the high byte (felucca-bsp main uses +0.80 low / +2.00 high there, which here are
@@ -647,7 +658,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 /* FELUCCA_USB_MANUFACTURER, FELUCCA_USB_PRODUCT: optional ASCII strings for the USB names (string
  * descriptors 1 and 2); without them the Hügelton / Felucca names below.
  * FELUCCA_USB_NAME_FN: the name of a function `const char *fn(void)` the product name is asked of each time a host reads it
- * (string 2, the MIDI device and its ports; with 0 that name + " In" / " Out", unless FELUCCA_UAC_IN_NAME /
+ * (string 2, the MIDI device and its ports; with FELUCCA_UAC_SPLIT that name + " In" / " Out", unless FELUCCA_UAC_IN_NAME /
  * FELUCCA_UAC_OUT_NAME say otherwise): for a name that carries something of this device (its address), known only at
  * run time. ASCII, at most 25 characters (a name + " Out" is 31 at most); NULL or "" = FELUCCA_USB_PRODUCT / the default. */
 #ifndef FELUCCA_USB_PID
@@ -720,7 +731,33 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #else
 #define UA_EP_ATTR 0x05
 #endif
+#if FELUCCA_UAC_SPLIT
+/* the two functions' names (string descriptors 3, 4) and the input's channels' (5 ..: iChannelNames) */
+#define UA_STR_IN 3
+#define UA_STR_OUT 4
+#ifdef FELUCCA_UAC_CH_NAMES
+#define UA_STR_CH 5
+#else
+#define UA_STR_CH 0
+#endif
+#if !defined(FELUCCA_UAC_IN_NAME) && !defined(FELUCCA_USB_NAME_FN)
+#ifdef FELUCCA_USB_PRODUCT
+#define FELUCCA_UAC_IN_NAME FELUCCA_USB_PRODUCT " In"
+#else
+#define FELUCCA_UAC_IN_NAME "Felucca In"
+#endif
+#endif
+#if !defined(FELUCCA_UAC_OUT_NAME) && !defined(FELUCCA_USB_NAME_FN)
+#ifdef FELUCCA_USB_PRODUCT
+#define FELUCCA_UAC_OUT_NAME FELUCCA_USB_PRODUCT " Out"
+#else
+#define FELUCCA_UAC_OUT_NAME "Felucca Out"
+#endif
+#endif
+#define D_IT_LINE 12, 0x24, 2, 1, 0x03, 0x06, 0, UA_CH, UA_CHCFG & 0xFF, UA_CHCFG >> 8, UA_STR_CH, 0,
+#else
 #define D_IT_LINE 12, 0x24, 2, 1, 0x03, 0x06, 0, UA_CH, UA_CHCFG & 0xFF, UA_CHCFG >> 8, 0, 0,
+#endif
 #if FELUCCA_UAC
 #if FELUCCA_UAC_OUT
 #define D_AC(a)                                                                                      \
@@ -813,6 +850,32 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
     5, 0x25, 1, 1, 1,                                                                                \
     9, 5, 0x81, 2, 64, 0, 0, 0, 0,                                                                   \
     5, 0x25, 1, 1, 3,
+#if FELUCCA_UAC_SPLIT
+/* three functions, each an IAD and an audio control interface of its own: MIDI (IF 0-1), the input (IF 2-3, its terminals
+ * 1 and 2), the output (IF 4-5, its terminals 3 and 4), each control's collection its one streaming interface */
+#define D_IADS(first, str) 8, 0x0B, (first), 2, 1, 1, 0, (str),
+#define D_AC_MIDI(a) 9, 4, (a), 0, 0, 1, 1, 0, 0, 9, 0x24, 1, 0x00, 0x01, 9, 0, 1, (a) + 1,   /* AC header: MIDI */
+#define D_AC_IN(a)                                                                                   \
+    9, 4, (a), 0, 0, 1, 1, 0, UA_STR_IN,                   /* audio control: the input, named */        \
+    9, 0x24, 1, 0x00, 0x01, 30, 0, 1, (a) + 1,             /* AC header: its stream */                  \
+    D_IT_LINE                                              /* input terminal 1: line, UA_CH ch (named) */ \
+    9, 0x24, 3, 2, 0x01, 0x01, 0, 1, 0,                    /* output terminal 2: USB streaming, from 1 */
+#define D_AC_OUT(a)                                                                                  \
+    9, 4, (a), 0, 0, 1, 1, 0, UA_STR_OUT,                  /* audio control: the output, named */       \
+    9, 0x24, 1, 0x00, 0x01, 30, 0, 1, (a) + 1,             /* AC header: its stream */                  \
+    12, 0x24, 2, 3, 0x01, 0x01, 0, 2, 0x03, 0x00, 0, 0,    /* input terminal 3: USB streaming, 2 ch */   \
+    9, 0x24, 3, 4, 0x01, 0x03, 0, 3, 0,                    /* output terminal 4: speaker, from 3 */
+#if FELUCCA_UAC_OUT
+#define D_FN_OUT(a) D_IADS((a), UA_STR_OUT) D_AC_OUT(a) D_ASO((a) + 1)
+#else
+#define D_FN_OUT(a)
+#endif
+#define D_AUDIO(a) D_IADS((a), 0) D_AC_MIDI(a) D_MIDI((a) + 1) D_IADS((a) + 2, UA_STR_IN) D_AC_IN((a) + 2) \
+                   D_AS((a) + 3) D_FN_OUT((a) + 4)
+#define AUD_NIF (2 + 2 * FELUCCA_UAC + 2 * FELUCCA_UAC_OUT)
+#define AUD_LEN (100 + (88 + FMT_LEN) * FELUCCA_UAC + (32 + FMT_LEN) * FELUCCA_UAC_24 + 99 * FELUCCA_UAC_OUT + \
+                 9 * FELUCCA_UAC_OUT_FEEDBACK + (43 + 9 * FELUCCA_UAC_OUT_FEEDBACK) * FELUCCA_UAC_OUT_24)
+#else
 /* audio + MIDI from interface a, in the order FELUCCA_UAC_MIDI_LAST picks */
 #if FELUCCA_UAC_MIDI_LAST
 #define D_AUDIO(a) D_AC(a) D_AS((a) + IF_AS) D_ASO((a) + IF_ASO) D_MIDI((a) + IF_MIDI)
@@ -822,6 +885,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #define AUD_NIF (2 + FELUCCA_UAC + FELUCCA_UAC_OUT)
 #define AUD_LEN (92 + (63 + FMT_LEN) * FELUCCA_UAC + (32 + FMT_LEN) * FELUCCA_UAC_24 + 74 * FELUCCA_UAC_OUT + \
                  9 * FELUCCA_UAC_OUT_FEEDBACK + (43 + 9 * FELUCCA_UAC_OUT_FEEDBACK) * FELUCCA_UAC_OUT_24 - (FELUCCA_UAC_MIDI_LAST == 2))
+#endif
 #define AUD_FN_NIF (AUD_NIF - (FELUCCA_UAC_MIDI_LAST == 2))   /* the audio function's (its IAD): AC + its collection */
 #define D_CDC(c)                                                                                     \
     D_IAD((c), 2, 2, 2, 1),                                /* IAD: CDC ACM */                           \
@@ -835,7 +899,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
     7, 5, 0x03, 2, 64, 0, 0,                               /* EP3 OUT bulk */                           \
     7, 5, 0x83, 2, 64, 0, 0,                               /* EP3 IN bulk */
 #define CDC_LEN 66                                         /* with its IAD */
-#define BCD_LO(cdc) (0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K) + 0x20 * UA_MC + 0x40 * FELUCCA_UAC_OUT + 0x08 * (FELUCCA_UAC_AS_FIRST || 0) + \
+#define BCD_LO(cdc) (0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K) + 0x20 * UA_MC + 0x40 * FELUCCA_UAC_OUT + 0x08 * (FELUCCA_UAC_AS_FIRST || FELUCCA_UAC_SPLIT) + \
                      0x80 * (FELUCCA_UAC_MIDI_LAST == 1) + 0x04 * FELUCCA_UAC_OUT_FEEDBACK + ((cdc) ? 0x01 + 2 * FELUCCA_USB_LAYOUT : 0))
 #define BCD_HI (0x03 + (FELUCCA_UAC_MIDI_LAST == 2) + 2 * FELUCCA_UAC_IAD + 0x08 * FELUCCA_UAC_OUT_24 + 0x10 * FELUCCA_UAC_CAPTURE + \
                 0x20 * (FELUCCA_UAC_CAPTURE && FELUCCA_UAC_CH == 8) + 0x40 * FELUCCA_UAC_HOST_CLOCK + 0x80 * FELUCCA_UAC_24)
@@ -852,7 +916,11 @@ static const uint8_t DEV_DESC_PLAIN[18] = {D_DEV(0x0200, 0xEF, 0x02, 0x01, 0)};
 static const uint8_t CFG_DESC_PLAIN[] = {D_CFG(CFG_LEN_PLAIN, AUD_NIF), D_IAD(0, AUD_FN_NIF, 1, 1, 0), D_AUDIO(0)};
 #else
 #define CFG_LEN_PLAIN (9 + AUD_LEN)
+#if FELUCCA_UAC_SPLIT
+static const uint8_t DEV_DESC_PLAIN[18] = {D_DEV(0x0200, 0xEF, 0x02, 0x01, 0)};   /* misc / IAD: its functions */
+#else
 static const uint8_t DEV_DESC_PLAIN[18] = {D_DEV(0x0110, 0, 0, 0, 0)};
+#endif
 static const uint8_t CFG_DESC_PLAIN[] = {D_CFG(CFG_LEN_PLAIN, AUD_NIF), D_AUDIO(0)};
 #endif
 typedef char cfg_plain_len_ok[sizeof CFG_DESC_PLAIN == CFG_LEN_PLAIN ? 1 : -1];
@@ -894,8 +962,13 @@ static uint8_t usb_cdc_on = FELUCCA_CDC_DEFAULT != 0;      /* the console is pre
 #define USB_CDC_ON 0
 #define AUD_IF 0u
 #endif
+#if FELUCCA_UAC_SPLIT
+#define UAC_AS_IF (AUD_IF + 3u)             /* the input's function: its control IF 2, its stream IF 3 */
+#define UAC_ASO_IF (AUD_IF + 5u)            /* the output's: 4 and 5 (FELUCCA_UAC_OUT) */
+#else
 #define UAC_AS_IF (AUD_IF + IF_AS)
 #define UAC_ASO_IF (AUD_IF + IF_ASO)        /* the output stream (FELUCCA_UAC_OUT) */
+#endif
 #if FELUCCA_MSC
 /* disk mode: one interface, mass storage (SCSI transparent, bulk-only), EP3 OUT and IN bulk; its own bcdDevice (a
  * changed device to the computer) and a serial number (the bulk-only transport asks for one) */
@@ -918,7 +991,7 @@ static const uint8_t STR2[] = {30, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c
 static const uint8_t STR2[] = {16, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c', 0, 'a', 0};
 #endif
 
-#if defined(FELUCCA_USB_MANUFACTURER) || defined(FELUCCA_USB_PRODUCT) || defined(FELUCCA_USB_NAME_FN) || 0
+#if defined(FELUCCA_USB_MANUFACTURER) || defined(FELUCCA_USB_PRODUCT) || defined(FELUCCA_USB_NAME_FN) || FELUCCA_UAC_SPLIT
 /* A string descriptor built from a plain ASCII string (the build settings FELUCCA_USB_MANUFACTURER and
  * FELUCCA_USB_PRODUCT, e.g. -DFELUCCA_USB_PRODUCT='"CTL-1 FM-1"'), at most 31 characters, and a suffix after it
  * (usb_str_desc2: " In" after a name asked at run time). EP0 sends one descriptor at a time, so one buffer serves all. */
@@ -946,6 +1019,10 @@ static int usb_str_desc2(const char *s, const char *tail, const uint8_t **d, uin
 #define usb_str_desc(s, d, l) usb_str_desc2((s), "", (d), (l))
 #endif
 
+#if FELUCCA_UAC_SPLIT && defined FELUCCA_UAC_CH_NAMES
+static const char *const UA_CH_NAME[] = {FELUCCA_UAC_CH_NAMES};   /* the input's channels, in order */
+_Static_assert(sizeof UA_CH_NAME / sizeof UA_CH_NAME[0] == UA_CH, "FELUCCA_UAC_CH_NAMES: a name for each input channel");
+#endif
 static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
 {
 #if FELUCCA_MSC
@@ -998,7 +1075,27 @@ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
             *l = sizeof STR2;
             return 1;
 #endif
+#if FELUCCA_UAC_SPLIT
+        case UA_STR_IN:
+#ifdef FELUCCA_UAC_IN_NAME
+            return usb_str_desc(FELUCCA_UAC_IN_NAME, d, l);
+#else
+            return usb_str_desc2(usb_product_name(), " In", d, l);
+#endif
+#if FELUCCA_UAC_OUT
+        case UA_STR_OUT:
+#ifdef FELUCCA_UAC_OUT_NAME
+            return usb_str_desc(FELUCCA_UAC_OUT_NAME, d, l);
+#else
+            return usb_str_desc2(usb_product_name(), " Out", d, l);
+#endif
+#endif
+#endif
         default:
+#if FELUCCA_UAC_SPLIT && defined FELUCCA_UAC_CH_NAMES
+            if ((wvalue & 0xFFu) - UA_STR_CH < UA_CH)   /* the input's channels */
+                return usb_str_desc(UA_CH_NAME[(wvalue & 0xFFu) - UA_STR_CH], d, l);
+#endif
             return 0;
         }
     default:
