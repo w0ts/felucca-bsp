@@ -43,7 +43,7 @@
  * streaming interface shares an audio control interface's collection with MIDI (macOS 13..15's kernel driver
  * stops at MIDI there: FELUCCA_UAC_AS_FIRST's case). Off (the default), nothing changes.
  * FELUCCA_UAC_CH=n (1..8, default 2) makes the input n channels: the caller's uac_tap gives n samples a frame (the
- * firmware's own stems, say); 2 keeps the stereo master and today's descriptors. 0=1 adds 24-bit: alt
+ * firmware's own stems, say); 2 keeps the stereo master and today's descriptors. FELUCCA_UAC_24=1 adds 24-bit: alt
  * setting 2 of the input stream (alt 1 stays 16-bit), the host picks either. uac_capturing says whether the host takes
  * the input this render (the caller skips its stems otherwise). Neither changes anything when left at its default.
  * FELUCCA_UAC_HOST_CLOCK=1 puts the input on the computer's clock: uac_tap resamples the I2S's frames to the USB
@@ -96,6 +96,9 @@
 #endif
 /* 0=1: the caller fills every channel (uac_tap's frames: its own routing); 0: the master on 1 and 2,
  * the caller's on 3..N by uac_ch_frame */
+#ifndef FELUCCA_UAC_24
+#define FELUCCA_UAC_24 0
+#endif
 #ifndef FELUCCA_UAC_HOST_CLOCK
 #define FELUCCA_UAC_HOST_CLOCK 0
 #endif
@@ -127,6 +130,11 @@
 #define FELUCCA_UAC_IAD 0
 #undef FELUCCA_UAC_CH
 #define FELUCCA_UAC_CH 2
+#undef FELUCCA_UAC_24
+#define FELUCCA_UAC_24 0
+#endif
+#if FELUCCA_UAC_48K && ((0 && FELUCCA_UAC_CH != 2) || FELUCCA_UAC_24)
+#error "FELUCCA_UAC_48K resamples stereo 16-bit only: set it to 0 with FELUCCA_UAC_CH != 2 or FELUCCA_UAC_24"
 #endif
 #if FELUCCA_UAC_HOST_CLOCK && FELUCCA_UAC_48K
 #error "FELUCCA_UAC_HOST_CLOCK resamples to 44.1 kHz only: set FELUCCA_UAC_48K to 0 with it"
@@ -156,8 +164,8 @@
 #else
 #define UA_MC 0
 #endif
-#if UA_MC && FELUCCA_UAC_HOST_CLOCK
-#error "0 and FELUCCA_UAC_HOST_CLOCK with more than 2 channels: 0 1"
+#if UA_MC && (FELUCCA_UAC_24 || FELUCCA_UAC_HOST_CLOCK)
+#error "FELUCCA_UAC_24 and FELUCCA_UAC_HOST_CLOCK with more than 2 channels: 0 1"
 #endif
 enum { S_FADDR = 0, S_POWER = 1, S_INTRTX1 = 2, S_INTRTX2 = 3, S_INTRRX1 = 4, S_INTRRX2 = 5, S_INTRUSB = 6,
        S_INTRTX1E = 7, S_INTRTX2E = 8, S_INTRRX1E = 9, S_INTRRX2E = 10, S_INTRUSBE = 11, S_FRAME1 = 12,
@@ -290,15 +298,20 @@ static inline uint32_t ua_add(uint32_t i, uint32_t n) { return i + n >= UA_WRAP 
 static inline uint32_t ua_fill(uint32_t w, uint32_t r) { return w >= r ? w - r : w + UA_WRAP - r; }
 typedef int16_t ua_smp_t;
 #else
-/* The input's channels (FELUCCA_UAC_CH) and sample sizes: alt 1 is 16-bit, alt 2 (0) 24-bit. The ring
+/* The input's channels (FELUCCA_UAC_CH) and sample sizes: alt 1 is 16-bit, alt 2 (FELUCCA_UAC_24) 24-bit. The ring
  * holds a frame's UA_CH samples side by side, 16-bit as they go out (so with 2 channels its bytes are the packet's),
- * or with 0 as the I2S takes them (24-bit in 32), packed for the alt the host chose as each packet goes. */
+ * or with FELUCCA_UAC_24 as the I2S takes them (24-bit in 32), packed for the alt the host chose as each packet goes. */
 #define UAC_NCH UA_CH
-#define UA_ALTS (1u + 0)    /* the input stream's alt settings that stream */
+#define UA_ALTS (1u + FELUCCA_UAC_24)    /* the input stream's alt settings that stream */
 #define UAC_MAXP16 (UA_MAXF * UA_CH * 2u)
 #define UAC_MAXP24 (UA_MAXF * UA_CH * 3u)
+#if FELUCCA_UAC_24
+#define UAC_MAXP UAC_MAXP24
+typedef int32_t ua_smp_t;
+#else
 #define UAC_MAXP UAC_MAXP16
 typedef int16_t ua_smp_t;
+#endif
 _Static_assert(UAC_MAXP <= 1023u, "a full-speed isochronous packet holds 1023 bytes: fewer channels, or 16-bit");
 _Static_assert(UA_HI + HALF_FRAMES + UA_MAXF < UA_N, "the ring holds the band, a render and a packet");
 /* 0 1 (fm1.toml usb_audio_mem = "app"): the input's and the output's rings are a block the app lends
@@ -563,7 +576,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
  * audio output (FELUCCA_UAC_OUT), +0.08 the audio streaming interfaces first in the AC collection
  * (FELUCCA_UAC_AS_FIRST), +0.80 its feedback (0), +0.01 CDC
  * (+0.02 per FELUCCA_USB_LAYOUT step, so a host never reuses what it learnt about another layout);
- * +1.00 with 24-bit (0), +10.00 x the channels when they are not 2 (FELUCCA_UAC_CH: 4 ch 16-bit 43.xx),
+ * +1.00 with 24-bit (FELUCCA_UAC_24), +10.00 x the channels when they are not 2 (FELUCCA_UAC_CH: 4 ch 16-bit 43.xx),
  * +2.00 on the computer's clock (FELUCCA_UAC_HOST_CLOCK: a synchronous endpoint), +8.00 with the output in 24-bit too
  * (0), +0.08 the two audio functions apart (0: misc / IAD, bcdUSB 2.00; in felucca-bsp's
  * main FELUCCA_UAC_AS_FIRST's +0.08 too: both take the audio streaming interfaces out of MIDI's way, the split for good).
@@ -697,7 +710,16 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
     9, 5, 0x84, UA_EP_ATTR, UAC_MAXP16 & 0xFF, UAC_MAXP16 >> 8, 1, 0, 0,   /* EP4 IN isochronous, 1 ms */ \
     7, 0x25, 1, 0x01, 0, 0, 0,                             /* CS endpoint: sampling frequency control */ \
     D_AS24(s)
+#if FELUCCA_UAC_24
+#define D_AS24(s)                                                                                    \
+    9, 4, (s), 2, 1, 1, 2, 0, 0,                           /* alt 2: the stream in 24-bit */            \
+    7, 0x24, 1, 2, 1, 0x01, 0x00,                          /* AS general: terminal 2, delay 1, PCM */   \
+    D_FMT(3, 24)                                           /* type I: UA_CH ch, 3 bytes, 24 bit */      \
+    9, 5, 0x84, UA_EP_ATTR, UAC_MAXP24 & 0xFF, UAC_MAXP24 >> 8, 1, 0, 0,   /* EP4 IN isochronous, 1 ms */ \
+    7, 0x25, 1, 0x01, 0, 0, 0,                             /* CS endpoint: sampling frequency control */
+#else
 #define D_AS24(s)
+#endif
 #else
 #define D_AC(a) 9, 4, (a), 0, 0, 1, 1, 0, 0, 9, 0x24, 1, 0x00, 0x01, 9, 0, 1, (a) + 1,
 #define D_AS(s)
@@ -721,7 +743,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #define D_AUDIO(a) D_AC(a) D_MIDI((a) + IF_MIDI) D_AS((a) + IF_AS) D_ASO((a) + IF_ASO)
 #endif
 #define AUD_NIF (2 + FELUCCA_UAC + FELUCCA_UAC_OUT)
-#define AUD_LEN (92 + (63 + FMT_LEN) * FELUCCA_UAC + (32 + FMT_LEN) * 0 + 74 * FELUCCA_UAC_OUT + \
+#define AUD_LEN (92 + (63 + FMT_LEN) * FELUCCA_UAC + (32 + FMT_LEN) * FELUCCA_UAC_24 + 74 * FELUCCA_UAC_OUT + \
                  9 * 0 + (43 + 9 * 0) * 0 - (FELUCCA_UAC_MIDI_LAST == 2))
 #define AUD_FN_NIF (AUD_NIF - (FELUCCA_UAC_MIDI_LAST == 2))   /* the audio function's (its IAD): AC + its collection */
 #define D_CDC(c)                                                                                     \
@@ -739,7 +761,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #define BCD_LO(cdc) (0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K) + 0x20 * UA_MC + 0x40 * FELUCCA_UAC_OUT + 0x08 * (FELUCCA_UAC_AS_FIRST || 0) + \
                      0x80 * (FELUCCA_UAC_MIDI_LAST == 1) + ((cdc) ? 0x01 + 2 * FELUCCA_USB_LAYOUT : 0))
 #define BCD_HI (0x03 + (FELUCCA_UAC_MIDI_LAST == 2) + 2 * FELUCCA_UAC_IAD + \
-                0x20 * (0 && FELUCCA_UAC_CH == 8) + 0x40 * FELUCCA_UAC_HOST_CLOCK)
+                0x20 * (0 && FELUCCA_UAC_CH == 8) + 0x40 * FELUCCA_UAC_HOST_CLOCK + 0x80 * FELUCCA_UAC_24)
 #define D_DEV(bcdusb, cls, sub, proto, cdc)                                                          \
     18, 1, (bcdusb) & 0xFF, (bcdusb) >> 8, (cls), (sub), (proto), 64, 0x09, 0x12, FELUCCA_USB_PID & 0xFF, \
     FELUCCA_USB_PID >> 8, BCD_LO(cdc), BCD_HI, 1, 2, 0, 1
@@ -2061,7 +2083,12 @@ static inline int32_t uac_s16(int32_t v)
 }
 /* a sample as the I2S takes it (24-bit, fm1_audio.h) to 16 bits, rounded */
 static inline int32_t uac_in16(int32_t v) { return uac_s16((v + 128) >> 8); }
+#if FELUCCA_UAC_24
+static inline int32_t uac_in24(int32_t v) { return v > 8388607 ? 8388607 : v < -8388608 ? -8388608 : v; }
+#define UA_SMP(v) uac_in24(v)    /* the ring keeps 24 bits: each packet packs them for its alt */
+#else
 #define UA_SMP(v) uac_in16(v)
+#endif
 
 #if FELUCCA_UAC_48K
 /* one tap into a sum, out of line and in registers only (docs/CPU.md: 64-bit multiplies inlined among loads, the
@@ -2266,7 +2293,7 @@ static __attribute__((noinline)) void uac_tap(const int32_t *out, uint32_t n)
         return;
     }
 #if FELUCCA_UAC_TONE
-#if FELUCCA_UAC_CH != 2 || 0
+#if FELUCCA_UAC_CH != 2 || FELUCCA_UAC_24
 #error "FELUCCA_UAC_TONE is stereo 16-bit"
 #endif
     {   /* bench: triangles of period 100 frames instead of the music (L, R in antiphase): every
@@ -2350,12 +2377,29 @@ static uint32_t uac_packet(uint32_t *dw)              /* as below, FELUCCA_UAC_C
     return n;
 }
 #else
-/* one frame of the ring to the wire at p, little-endian: 16-bit, or with 0 in alt 2 (wide) 24-bit */
+/* one frame of the ring to the wire at p, little-endian: 16-bit, or with FELUCCA_UAC_24 in alt 2 (wide) 24-bit */
 static inline uint8_t *uac_put(uint8_t *p, const ua_smp_t *f, uint32_t wide)
 {
+#if FELUCCA_UAC_24
+    uint32_t c;
+    for (c = 0; c < UA_CH; c++) {
+        int32_t v = f[c];
+        if (wide) {
+            *p++ = (uint8_t)v;
+            *p++ = (uint8_t)(v >> 8);
+            *p++ = (uint8_t)(v >> 16);
+            continue;
+        }
+        v = uac_in16(v);
+        *p++ = (uint8_t)v;
+        *p++ = (uint8_t)(v >> 8);
+    }
+    return p;
+#else
     (void)wide;
     __builtin_memcpy(p, f, UA_CH * 2u);                 /* the ring's frame is the packet's (16-bit, little-endian) */
     return p + UA_CH * 2u;
+#endif
 }
 
 /* the next packet into d: 44 / 45 frames (+-1 to hold the ring's fill; the pattern alone with FELUCCA_UAC_HOST_CLOCK),
