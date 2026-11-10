@@ -714,6 +714,15 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
  * (string 2, the MIDI device and its ports; with FELUCCA_UAC_SPLIT that name + " In" / " Out", unless FELUCCA_UAC_IN_NAME /
  * FELUCCA_UAC_OUT_NAME say otherwise): for a name that carries something of this device (its address), known only at
  * run time. ASCII, at most 25 characters (a name + " Out" is 31 at most); NULL or "" = FELUCCA_USB_PRODUCT / the default. */
+/* FELUCCA_USB_SERIAL_FN: the name of a function `const char *fn(void)` giving this device's serial number (ASCII, at most
+ * 31 characters; NULL or "" reads "0"), asked each time a host reads it. Without it the device has no serial number
+ * (iSerialNumber 0), and a host tells two of them apart by the USB port only: macOS's MIDI setup gives a device the name
+ * it kept for that port, so two FM-1s swapped between ports, or one with a new name, show the old name. */
+#ifdef FELUCCA_USB_SERIAL_FN
+#define USB_STR_SERIAL 0x30   /* (clear of 3, 4 and the input's channel names from 5) */
+#else
+#define USB_STR_SERIAL 0
+#endif
 #ifndef FELUCCA_USB_PID
 #define FELUCCA_USB_PID 0x0001   /* the update loader is 0x0002 */
 #endif
@@ -792,6 +801,9 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
 #define UA_STR_CH 5
 #else
 #define UA_STR_CH 0
+#endif
+#if defined(FELUCCA_USB_SERIAL_FN) && defined(FELUCCA_UAC_CH_NAMES)
+_Static_assert(UA_STR_CH + FELUCCA_UAC_CH <= USB_STR_SERIAL, "the channel names' strings reach the serial number's");
 #endif
 #if !defined(FELUCCA_UAC_IN_NAME) && !defined(FELUCCA_USB_NAME_FN)
 #ifdef FELUCCA_USB_PRODUCT
@@ -958,7 +970,7 @@ static uint32_t midi_out_room(void)                  /* free slots in the out ri
                 0x20 * (FELUCCA_UAC_CAPTURE && FELUCCA_UAC_CH == 8) + 0x40 * FELUCCA_UAC_HOST_CLOCK + 0x80 * FELUCCA_UAC_24)
 #define D_DEV(bcdusb, cls, sub, proto, cdc)                                                          \
     18, 1, (bcdusb) & 0xFF, (bcdusb) >> 8, (cls), (sub), (proto), 64, 0x09, 0x12, FELUCCA_USB_PID & 0xFF, \
-    FELUCCA_USB_PID >> 8, BCD_LO(cdc), BCD_HI, 1, 2, 0, 1
+    FELUCCA_USB_PID >> 8, BCD_LO(cdc), BCD_HI, 1, 2, USB_STR_SERIAL, 1
 
 /* without the console (FELUCCA_CDC=0, or usb_cdc_on = 0): class 0, no IAD, as a plain USB-MIDI / audio device.
  * FELUCCA_UAC_IAD=1: an IAD over the audio function (audio control + its collection), so the device is misc / IAD
@@ -1044,9 +1056,13 @@ static const uint8_t STR2[] = {30, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c
 static const uint8_t STR2[] = {16, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c', 0, 'a', 0};
 #endif
 
-#if defined(FELUCCA_USB_MANUFACTURER) || defined(FELUCCA_USB_PRODUCT) || defined(FELUCCA_USB_NAME_FN) || FELUCCA_UAC_SPLIT
+#if defined(FELUCCA_USB_MANUFACTURER) || defined(FELUCCA_USB_PRODUCT) || defined(FELUCCA_USB_NAME_FN) || FELUCCA_UAC_SPLIT || \
+    defined(FELUCCA_USB_SERIAL_FN)
 #ifdef FELUCCA_USB_NAME_FN
 extern const char *FELUCCA_USB_NAME_FN(void);
+#endif
+#ifdef FELUCCA_USB_SERIAL_FN
+extern const char *FELUCCA_USB_SERIAL_FN(void);
 #endif
 /* A string descriptor built from a plain ASCII string (the build settings FELUCCA_USB_MANUFACTURER and
  * FELUCCA_USB_PRODUCT, e.g. -DFELUCCA_USB_PRODUCT='"CTL-1 FM-1"'), at most 31 characters, and a suffix after it
@@ -1145,6 +1161,12 @@ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
             *d = STR2;
             *l = sizeof STR2;
             return 1;
+#endif
+#ifdef FELUCCA_USB_SERIAL_FN
+        case USB_STR_SERIAL: {
+            const char *sn = FELUCCA_USB_SERIAL_FN();
+            return usb_str_desc(sn && sn[0] ? sn : "0", d, l);
+        }
 #endif
 #if FELUCCA_UAC_SPLIT
         case UA_STR_IN:

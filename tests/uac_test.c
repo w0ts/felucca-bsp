@@ -177,6 +177,13 @@ static void fm1_delay_ms(uint32_t ms) { (void)ms; }
 const char *test_name_fn(void) { return "FM1-1A2B"; }       /* FELUCCA_USB_NAME_FN: the name asked at run time */
 #define FELUCCA_USB_NAME_FN test_name_fn
 #endif
+#ifndef TEST_SERIAL
+#define TEST_SERIAL 0                                   /* with it: FELUCCA_USB_SERIAL_FN gives "0123456789ABCDEF" */
+#endif
+#if TEST_SERIAL
+const char *test_serial_fn(void) { return "0123456789ABCDEF"; }   /* FELUCCA_USB_SERIAL_FN: this device's serial number */
+#define FELUCCA_USB_SERIAL_FN test_serial_fn
+#endif
 #define FELUCCA_CDC TEST_CDC
 #define FELUCCA_OTA 0
 #define FELUCCA_USB_HOST 0
@@ -404,6 +411,20 @@ static void test_descriptors(void)
             assert(sd[2 + 2 * j] == (uint8_t)"FM1-1A2B"[j] && sd[3 + 2 * j] == 0);
     }
 #endif
+    {   /* the serial number: string 0x30 with FELUCCA_USB_SERIAL_FN, none (iSerialNumber 0) without */
+        const uint8_t *sd;
+        uint16_t sl;
+        uint32_t j;
+#if TEST_SERIAL
+        assert(dv[16] == 0x30);
+        assert(get_desc(0x0330, &sd, &sl) && sd[1] == 3 && sl == sd[0] && sl == 2u + 2u * 16u);
+        for (j = 0; j < 16u; j++)
+            assert(sd[2 + 2 * j] == (uint8_t)"0123456789ABCDEF"[j] && sd[3 + 2 * j] == 0);
+#else
+        (void)sd; (void)sl; (void)j;
+        assert(dv[16] == 0);
+#endif
+    }
     assert(it_ok && alts == 1u + TEST_24);
     assert(out_eps == TEST_OUT * (1u + TEST_O24) && fb_eps == TEST_FB * (1u + TEST_O24));
     assert(out_alts == TEST_OUT * (1u + TEST_O24));
@@ -452,6 +473,8 @@ static void test_descriptors(void)
             gd[13] = (uint8_t)(gd[13] + 0x40);
         assert(eps == (TEST_HC ? 1u : 0u));
         assert(l == gl && !memcmp(d, g, l));
+        if (TEST_SERIAL)
+            gd[16] = 0x30;                               /* (iSerialNumber: the serial string) */
         assert(!memcmp(dv, gd, 18));
     }
 #endif
