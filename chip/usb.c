@@ -3038,6 +3038,69 @@ static void uac_service(void)
 }
 #endif
 
+/* Real-time messages sent at once (usb_midi_rt): a MIDI clock tick loaded into EP1 the moment it is due, not at the next
+ * 2 kHz poll, and not held while the poll waits for the audio render (usb_poll never runs nested; a tick could wait out
+ * a whole render). Measured on a Mac before this: a clock out through midi_out_q, released by a 1 kHz tick, scattered
+ * 418 us (sd) around its own line, up to 1.5 ms. Called from the TIMER5 tick (0.1 ms), nested in the render or not:
+ * the only other SIE user, usb_poll, runs in the same interrupt, never inside it, and sets INDEX itself. One producer
+ * (the tick), so the ring needs no lock. While a packet is still on EP1 (TxPktRdy), what is waiting goes at the next
+ * tick (usb_midi_rt_kick) or the poll, ahead of midi_out_q. USB-MIDI packets are whole events, so one between two of
+ * a SysEx message is legal. */
+#define RTN 8u
+static uint32_t rt_q[RTN];
+static uint32_t rt_qw, rt_qr;
+static uint8_t ep1rt[4u * RTN] __attribute__((aligned(4)));
+static void usb_midi_rt_kick(void)
+{
+    uint32_t csr, n = 0;
+    if (rt_qr == rt_qw)
+        return;
+#if FELUCCA_USB_HOST
+    if (uh.on) {
+        rt_qr = rt_qw;                                  /* (no computer on the port: nothing to send to) */
+        return;
+    }
+#endif
+#if FELUCCA_MSC
+    if (usb_msc_on) {
+        rt_qr = rt_qw;
+        return;
+    }
+#endif
+    if (!usb.up || !usb.config) {
+        rt_qr = rt_qw;
+        return;
+    }
+    sie_wr(S_INDEX, 1);
+    csr = sie_rd(S_TXCSR1);
+    if (csr & 0x01u)
+        return;                                         /* the last packet not taken yet: the next tick */
+    if (csr & 0x80u)
+        sie_wr(S_TXCSR1, csr & ~0x80u);
+    while (rt_qr != rt_qw) {
+        uint32_t pkt = rt_q[rt_qr % RTN];
+        ep1rt[n] = (uint8_t)pkt;
+        ep1rt[n + 1] = (uint8_t)(pkt >> 8);
+        ep1rt[n + 2] = (uint8_t)(pkt >> 16);
+        ep1rt[n + 3] = (uint8_t)(pkt >> 24);
+        n += 4u;
+        rt_qr++;
+    }
+    fm1_usb_ep_send(1, ep1rt, n);
+    sie_wr(S_TXCSR1, sie_rd(S_TXCSR1) | 0x01u);
+    usb.tx_pkts++;
+}
+/* a USB-MIDI packet (a clock tick, Start, Stop) to the computer now; 0 when 8 are already waiting (dropped) */
+static __attribute__((unused)) int usb_midi_rt(uint32_t pkt)
+{
+    if (rt_qw - rt_qr >= RTN)
+        return 0;
+    rt_q[rt_qw % RTN] = pkt;
+    rt_qw++;
+    usb_midi_rt_kick();
+    return 1;
+}
+
 static void usb_poll(void)                              /* TIMER5 ISR, 2 kHz */
 {
     uint32_t iu, it, ir;
@@ -3155,8 +3218,10 @@ static void usb_poll(void)                              /* TIMER5 ISR, 2 kHz */
         usb.rx_pend = 1;
     if (usb.rx_pend)                                    /* not every poll: 3 SIE round trips each */
         ep1_rx();
-    if (usb.config)
+    if (usb.config) {
+        usb_midi_rt_kick();                             /* (real-time first: usb_midi_rt) */
         ep1_tx();
+    }
 #if FELUCCA_CDC
     if (usb.config && usb_cdc_on) {
         if (ir & 0x08u)
