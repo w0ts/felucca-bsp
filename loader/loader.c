@@ -4,7 +4,8 @@
  * an update record, with interrupts off: USB is polled from the main loop.
  * It is a USB-MIDI device "Felucca Update" (1209:0002) that answers the
  * M-UPGRADE update protocol as "ota-FM-1_900" (hosts look for "ota-"), and
- * writes the app area only (ldr_core.c). The UBOOT soft key works here too.
+ * writes the app area (ldr_core.c), and an app's resource region when the package carries one. The UBOOT soft key
+ * works here too.
  * Single compilation unit. */
 #include <stdint.h>
 #define FELUCCA_LOADER 1
@@ -21,11 +22,14 @@
 /* the loader may write the app area and clear update records (program over one, or erase its own staging); never
  * the head, nor Felucca's store [FL_DATA_LO, 0xE0000) (user data, never a record: ldr_core.c), but for what a change of
  * slot clears (LDR_SLOT_SWITCH, ldr_core.c ldr_slot_switch: the old app's code above this one's end, or a bigger
- * slot's LDR_CLEAR_END data) */
+ * slot's LDR_CLEAR_END data), and the sectors of an app's resource region while ldr_core.c writes them
+ * (ldr_res_window: in RAM, as the whole loader) */
+static uint32_t ldr_res_lo, ldr_res_hi;
+#define LDR_RES_OK(off, n) (ldr_res_hi && FL_IN(off, n, ldr_res_lo, ldr_res_hi))
 #if defined(LDR_SLOT_SWITCH) && LDR_SLOT_SWITCH
-#define FL_RANGE_OK(off, n) FL_IN(off, n, 0x4000u, 0xFC000u)
+#define FL_RANGE_OK(off, n) (FL_IN(off, n, 0x4000u, 0xFC000u) || LDR_RES_OK(off, n))
 #else
-#define FL_RANGE_OK(off, n) (FL_IN(off, n, 0x4000u, FL_DATA_LO) || FL_IN(off, n, 0xE0000u, 0xFC000u))
+#define FL_RANGE_OK(off, n) (FL_IN(off, n, 0x4000u, FL_DATA_LO) || FL_IN(off, n, 0xE0000u, 0xFC000u) || LDR_RES_OK(off, n))
 #endif
 #include "fm1_flash.h"
 #include "../chip/libc.c"
@@ -121,6 +125,11 @@ static int ldr_erase_end(void)
     return fl_erase4k_end_ram(&ldr_er_saved, ldr_er_issued, &took);
 }
 static void ldr_progress(uint32_t done, uint32_t total) { ldr_screen_progress(done, total); ldr_poll(); }
+static void ldr_res_window(uint32_t lo, uint32_t hi)
+{
+    ldr_res_lo = lo;
+    ldr_res_hi = hi;
+}
 #include "ldr_core.c"
 
 extern uint32_t _bss_start[], _bss_end[];
