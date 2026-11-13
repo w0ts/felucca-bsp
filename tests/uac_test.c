@@ -275,7 +275,7 @@ static void test_tap(void)
         }
         uac_tap(out, HALF_FRAMES);
         sent += uac.feed ? HALF_FRAMES : 0u;
-        while (ua_fill(ua_w, ua_r) > UA_LO + UA_MAXF) {
+        while (ua_fill(ua_w, ua_r) > 64u + UA_MAXF) {   /* (some kept in hand: the ring's old low band is gone) */
             uint32_t n = uac_packet(pkt);
             const int16_t *d = (const int16_t *)pkt;
             for (i = 0; i < n; i++, d += UAC_NCH) {
@@ -726,7 +726,7 @@ static double test_hc(hc_case t)
             if (!uac_capturing())
                 continue;
             if (now > 100.0) {
-                uint32_t f = uac.fill_min;
+                uint32_t f = ua_w - ua_r;               /* the fill as this render starts */
                 double s = ((double)hc.step / HC_ONE / (nominal * k / 44100.0) - 1.0) * 1e6;
                 lo = f < lo ? f : lo;
                 hi = f > hi ? f : hi;
