@@ -188,6 +188,10 @@ const char *test_serial_fn(void) { return "0123456789ABCDEF"; }   /* FELUCCA_USB
 #define FELUCCA_OTA 0
 #define FELUCCA_USB_HOST 0
 #define HALF_FRAMES 256u
+/* uac_size's clock (the FM-1's crystal, 24 MHz): a packet a call, each a host's ms later (the pacing itself:
+ * tests/usb_host_test.c test_uac_pace) */
+static uint32_t uac_test_clock(void) { static uint32_t t; return t += 24000u; }
+#define FELUCCA_UAC_CLOCK() uac_test_clock()
 #include "../chip/usb.c"
 
 /* ------------------------------------------------------------ helpers --- */

@@ -554,7 +554,8 @@ static void refused(const char *name, const pkg_t *p, int fast, uint32_t mode, i
 static void cut_sweep(const char *name, const pkg_t *p, uint32_t old_len, uint32_t old_end, int fast, uint32_t clo,
                       uint32_t chi, int failing)
 {
-    long total, k, step, points = 0, resumed = 0, left = 0;
+    long total, k, step;
+    volatile long points = 0, resumed = 0, left = 0;   /* (kept across the cuts' longjmp: gcc -Wclobbered) */
     int rc, tries, fails0 = fails, v0 = violations;
     begin(name);
     dev_init(old_len, old_end);
