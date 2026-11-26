@@ -50,6 +50,29 @@ static struct {
     volatile uint32_t pkts, events;
 } uh;
 
+/* Raw input (usb_host_raw): the device's USB-MIDI event packets as they come, every cable, SysEx too, for an application
+ * that speaks to the device itself (a Launchpad's pads and its Programmer-mode answer); they then do not reach the MIDI
+ * input ring. One writer (uh_poll, TIMER5), one reader (the main loop, usb_host_rx): nothing is masked. Empty packets
+ * (CIN 0, a device's padding) are left out. A full ring keeps the USB packet in the endpoint until there is room. */
+#define UH_RAW_N 64u                                    /* a power of two */
+static uint32_t uh_raw_q[UH_RAW_N];
+static volatile uint32_t uh_raw_w, uh_raw_r;
+static volatile uint8_t uh_raw;                         /* the application takes the packets (main loop sets it) */
+static void usb_host_raw(uint32_t on)                   /* main loop: 1 raw, 0 the MIDI input as before; what waits is dropped */
+{
+    uh_raw = (uint8_t)(on != 0);
+    uh_raw_r = uh_raw_w;
+}
+static int usb_host_rx(uint32_t *pkt)                   /* main loop: the oldest raw packet; 0 when none */
+{
+    uint32_t r = uh_raw_r;
+    if (r == uh_raw_w)
+        return 0;
+    *pkt = uh_raw_q[r % UH_RAW_N];
+    uh_raw_r = r + 1u;
+    return 1;
+}
+
 /* Main-loop request only. usb_host_task performs the actual mode transition. */
 static void usb_host_switch(uint32_t on) { if (!usb.detached) uh.want = on != 0; }
 static uint32_t usb_host_active(void) { return uh.on; }
@@ -571,6 +594,25 @@ static void uh_poll(void)
         if (n > 64u)
             n = 64u;
         fm1_usb_rx_sync();
+        if (uh_raw) {                                   /* the application's: every packet as it came (usb_host_raw) */
+            if (UH_RAW_N - (uh_raw_w - uh_raw_r) < 16u)
+                return;                                 /* its ring too full: the packet stays, retried next poll */
+            for (i = 0; i + 3u < n; i += 4u) {
+                uint32_t p = (uint32_t)uh_rx[i] | (uint32_t)uh_rx[i + 1] << 8 | (uint32_t)uh_rx[i + 2] << 16 |
+                             (uint32_t)uh_rx[i + 3] << 24;
+                if (!(p & 15u))
+                    continue;                           /* (CIN 0: padding) */
+                uh_raw_q[uh_raw_w % UH_RAW_N] = p;
+                RING_PUBLISH();
+                uh_raw_w++;
+                uh.events++;
+            }
+            uh.pkts++;
+            uh.errors = 0;
+            sie_wr(S_RXCSR1, 0x10u);
+            sie_wr(S_RXCSR1, 0x20u);
+            return;
+        }
 #ifndef FELUCCA_LOADER
         if (MQ - (mi_w - mi_r) < EP1_ROOM)
             return;                                     /* ring too full: the packet stays, retried next poll */
